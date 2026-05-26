@@ -9,3 +9,5 @@ supervision
 trackers
 opencv-python
 numpy
+python-multipart
+pymilvus

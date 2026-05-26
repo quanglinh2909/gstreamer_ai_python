@@ -56,4 +56,6 @@ class CameraService:
             return await AIRepository.get_by_camera_and_job(db, camera_id, job_id)
 
 
+
+
 camera_service = CameraService()

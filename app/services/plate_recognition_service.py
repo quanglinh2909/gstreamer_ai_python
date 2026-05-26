@@ -3,6 +3,7 @@ import datetime
 import os
 import re
 import sys
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dto.plate_recognition_dto import PlateRecognitionDTO
 from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.models.event_plate import EventPlate
+from app.repositories.event_plate_repository import EventPlateRepository
 from app.services.ai_job_service import AIJobSpec, ai_job_service
 from app.utils.plate_recognition_hepper import detect_plate_from_children
 
@@ -34,6 +36,28 @@ UPLOADS_ROOT = os.path.join(
 class PlateRecognitionService:
     async def plate_recognition(self, db: AsyncSession, req: PlateRecognitionDTO):
         return await ai_job_service.upsert(db, req, PLATE_SPEC)
+
+    async def test_inference(
+        self,
+        image: tuple,
+        primary_conf: float = 0.3,
+        secondary_conf: float = 0.3,
+    ):
+        return await ai_job_service.inference_with_spec(
+            image=image,
+            spec=PLATE_SPEC,
+            primary_conf=primary_conf,
+            secondary_conf=secondary_conf,
+        )
+
+    async def list_events(
+        self,
+        db: AsyncSession,
+        page: int,
+        size: int,
+        camera_id: Optional[str] = None,
+    ):
+        return await EventPlateRepository.list_paginated(db, page, size, camera_id)
 
     @staticmethod
     def _find_parent(meta, tid):
@@ -93,7 +117,6 @@ class PlateRecognitionService:
                 db.add(
                     EventPlate(
                         camera_id=str(meta["cameraId"]),
-                        type=TypeConfigAiEnum.PLATE_RECOGNITION.value,
                         plate_number=text_plate,
                         confidence=float(parent.get("score", 0.0)),
                         timestamp=int(timestamp),

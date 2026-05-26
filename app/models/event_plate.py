@@ -9,7 +9,6 @@ class EventPlate(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     camera_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    type: Mapped[str] = mapped_column(String(255), nullable=False)
     plate_number: Mapped[str] = mapped_column(String(255), nullable=False)
     confidence: Mapped[float] = mapped_column(nullable=False)
     timestamp: Mapped[int] = mapped_column(nullable=False)

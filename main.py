@@ -16,7 +16,8 @@ from fastapi.staticfiles import StaticFiles
 
 from app.app import api_router
 from app.core.database import Base, engine
-from app.models import ai_config, event_plate  # noqa: F401 - đăng ký model vào Base.metadata
+from app.core.milvus import close_client, get_client
+from app.models import ai_config, event_face, event_plate, identity  # noqa: F401 - đăng ký model vào Base.metadata
 
 UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -26,9 +27,11 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    get_client()
     threading.Thread(target=process_ai_service.start, daemon=True).start()
     yield
     process_ai_service.stop()
+    close_client()
 
 
 app = FastAPI(

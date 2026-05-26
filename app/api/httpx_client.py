@@ -82,6 +82,7 @@ class HTTPXClient:
         url: str,
         data: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
     ):
         return await HTTPXClient._request(
@@ -89,6 +90,7 @@ class HTTPXClient:
             url,
             data=data,
             json=json,
+            files=files,
             headers=headers,
         )
 
