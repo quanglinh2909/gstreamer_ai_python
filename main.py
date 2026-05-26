@@ -8,12 +8,18 @@ from app.services.process_ai_service import process_ai_service
 
 logging.basicConfig(level=logging.INFO)
 
+import os
+
 import uvicorn
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.app import api_router
 from app.core.database import Base, engine
-from app.models import ai_config  # noqa: F401 - đăng ký model vào Base.metadata
+from app.models import ai_config, event_plate  # noqa: F401 - đăng ký model vào Base.metadata
+
+UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 
 @asynccontextmanager
@@ -32,6 +38,8 @@ app = FastAPI(
     title="GStreamer AI API",
     lifespan=lifespan,
 )
+
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 # app.include_router(api_router_ws, prefix="/ws")
 

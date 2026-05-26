@@ -65,7 +65,7 @@ class ProcessAiService:
     async def _recv_loop(self):
         while self.running:
             try:
-                message = self.recv_message(self.sock)
+                message = await asyncio.to_thread(self.recv_message, self.sock)
             except OSError:
                 return
             if message is None:
@@ -104,6 +104,7 @@ class ProcessAiService:
                     "overlap_threshold": ai_config.overlap_threshold,
                     "dwell_seconds": ai_config.dwell_seconds or 0,
                     "service_ai": ProcessAiHepper.get_service_ai(ai_config.type),
+                    "secondary_conf": ai_config.secondary_conf,
                 }
             else:
                 state = self.process_ai[camera_id][job_id]
@@ -117,12 +118,26 @@ class ProcessAiService:
                 overlap_threshold = state["overlap_threshold"]
                 dwell_seconds = state["dwell_seconds"]
                 service_ai = state["service_ai"]
+                secondary_conf = state["secondary_conf"]
 
                 detections = ProcessAiHepper.to_sv_detections(meta.get("detections", []))
                 detections = ProcessAiHepper.update_tracker(tracker, detections, full_jpeg)
                 if detections.tracker_id is None or len(detections) == 0:
                     continue
                 detections = detections[detections.tracker_id >= 0]
+
+                raw_dets = meta.get("detections", [])
+                if len(detections) and raw_dets:
+                    raw_xyxy = np.array(
+                        [[d["x1"], d["y1"], d["x2"], d["y2"]] for d in raw_dets],
+                        dtype=np.float32,
+                    )
+                    for i in range(len(detections)):
+                        box = detections.xyxy[i]
+                        for j in range(len(raw_dets)):
+                            if np.array_equal(raw_xyxy[j], box):
+                                raw_dets[j]["tracker_id"] = int(detections.tracker_id[i])
+                                break
 
                 now = time.time()
                 for zone_idx, polygon in enumerate(polygons):
@@ -141,25 +156,25 @@ class ProcessAiService:
                         if tid not in ids_in_zone[zone_idx]:
                             # print(f"ID {tid} ENTERED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "entered_zone"):
-                                service_ai.entered_zone(tid, meta, full_jpeg, now)
+                                service_ai.entered_zone(tid, meta, full_jpeg, now, secondary_conf)
                             ids_in_zone[zone_idx].add(tid)
                             entered_at[zone_idx][tid] = now
                         elif dwell_seconds > 0 and tid not in dwell_alerted[zone_idx]:
                             if now - entered_at[zone_idx].get(tid, now) >= dwell_seconds:
                                 # print(f"ID {tid} STAYED in zone {zone_idx} for {dwell_seconds}s")
                                 if service_ai is not None and hasattr(service_ai, "dwell_alert"):
-                                    service_ai.dwell_alert(tid, meta, full_jpeg, now)
+                                    service_ai.dwell_alert(tid, meta, full_jpeg, now, secondary_conf)
                                 dwell_alerted[zone_idx].add(tid)
                         else:
                             if service_ai is not None and hasattr(service_ai, "in_the_area"):
-                                service_ai.in_the_area(tid, meta, full_jpeg, now)
+                                service_ai.in_the_area(tid, meta, full_jpeg, now, secondary_conf)
 
                     for tid in list(ids_in_zone[zone_idx] - current_ids):
                         exit_pending[zone_idx][tid] = exit_pending[zone_idx].get(tid, 0) + 1
                         if exit_pending[zone_idx][tid] >= fps:
                             # print(f"ID {tid} EXITED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "exited_zone"):
-                                service_ai.exited_zone(tid, meta, full_jpeg, now)
+                                service_ai.exited_zone(tid, meta, full_jpeg, now, secondary_conf)
                             ids_in_zone[zone_idx].discard(tid)
                             exit_pending[zone_idx].pop(tid, None)
                             entered_at[zone_idx].pop(tid, None)

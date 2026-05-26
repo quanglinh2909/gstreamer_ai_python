@@ -1,25 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import math
-import signal
-import sys
-import time
+
 from itertools import combinations
-
-import cv2
-
-from ai_result_viewer import (
-    AI_DET_MAX,
-    AI_DET_SECONDARY_MAX,
-    clamp_box,
-    draw_label,
-    frame_from_packet,
-    map_orig_to_infer,
-    open_packet_mmap,
-    packet_from_mmap,
-    packet_valid,
-)
-
 
 RUNNING = True
 
@@ -41,25 +24,6 @@ CONFUSED_TO_DIGIT = {
     "G": "6",
     "B": "8",
 }
-
-
-def on_signal(signum, frame):
-    del signum, frame
-    global RUNNING
-    RUNNING = False
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Read AiDetPacket shared memory and log reconstructed plate text from model-2 OCR detections."
-    )
-    parser.add_argument("--job-id", required=True, help="AI job id, maps to /ai_det_<job_id>")
-    parser.add_argument("--fps-limit", type=float, default=20.0, help="Polling rate limit")
-    parser.add_argument("--min-secondary-conf", type=float, default=0.0, help="Ignore OCR boxes below this confidence")
-    parser.add_argument("--print-all", action="store_true", help="Print every frame instead of only changes")
-    parser.add_argument("--show-window", action="store_true", help="Show realtime image window with plate boxes/text")
-    parser.add_argument("--window-name", default=None, help="Override display window title")
-    return parser.parse_args()
 
 
 def linear_equation(x1, y1, x2, y2):
@@ -140,10 +104,10 @@ def _filter_edge_noise_boxes(center_list, image_shape, min_conf=0.5, narrow_rati
     filtered = []
     for item in center_list:
         touches_border = (
-            item["x1"] <= 1
-            or item["y1"] <= 1
-            or item["x2"] >= image_width - 1
-            or item["y2"] >= image_height - 1
+                item["x1"] <= 1
+                or item["y1"] <= 1
+                or item["x2"] >= image_width - 1
+                or item["y2"] >= image_height - 1
         )
         is_narrow = item["width"] < median_width * narrow_ratio
         is_low_confidence = item["conf"] < min_conf
@@ -212,10 +176,10 @@ def _box_noise_score(box, line_boxes, image_shape, median_width, median_height):
     if image_shape:
         image_height, image_width = image_shape
         if (
-            box["x1"] <= 1
-            or box["y1"] <= 1
-            or box["x2"] >= image_width - 1
-            or box["y2"] >= image_height - 1
+                box["x1"] <= 1
+                or box["y1"] <= 1
+                or box["x2"] >= image_width - 1
+                or box["y2"] >= image_height - 1
         ):
             score += 0.35
 
@@ -325,7 +289,7 @@ def build_secondary_boxes(det, min_secondary_conf):
     if det.secondary_model_height > 0 and det.secondary_model_width > 0:
         image_shape = (det.secondary_model_height, det.secondary_model_width)
 
-    for idx in range(min(det.secondary_det_count, AI_DET_SECONDARY_MAX)):
+    for idx in range(min(det.secondary_det_count, 16)):
         sdet = det.secondary_dets[idx]
         if sdet.score < min_secondary_conf:
             continue
@@ -351,8 +315,7 @@ def build_secondary_boxes(det, min_secondary_conf):
     return center_list, image_shape
 
 
-def detect_plate_from_secondary(det, min_secondary_conf):
-    center_list, image_shape = build_secondary_boxes(det, min_secondary_conf)
+def _detect_plate_from_center_list(center_list, image_shape):
     if not center_list:
         return ""
 
@@ -373,12 +336,51 @@ def detect_plate_from_secondary(det, min_secondary_conf):
     if l_point["x_c"] != r_point["x_c"]:
         for ct in center_list:
             if not check_point_linear(
-                ct["x_c"], ct["y_c"],
-                l_point["x_c"], l_point["y_c"],
-                r_point["x_c"], r_point["y_c"],
+                    ct["x_c"], ct["y_c"],
+                    l_point["x_c"], l_point["y_c"],
+                    r_point["x_c"], r_point["y_c"],
             ):
                 lp_type = "2"
                 break
 
     return _build_plate_text(center_list, lp_type, image_shape)
 
+
+def detect_plate_from_secondary(det, min_secondary_conf):
+    center_list, image_shape = build_secondary_boxes(det, min_secondary_conf)
+    return _detect_plate_from_center_list(center_list, image_shape)
+
+
+def build_secondary_boxes_from_children(children, min_secondary_conf):
+    center_list = []
+    for child in (children or [])[:16]:
+        score = float(child.get("score", 0.0))
+        if score < min_secondary_conf:
+            continue
+        x1 = float(child["x1"])
+        y1 = float(child["y1"])
+        x2 = float(child["x2"])
+        y2 = float(child["y2"])
+        width = max(0.0, x2 - x1)
+        height = max(0.0, y2 - y1)
+        center_list.append(
+            {
+                "x_c": (x1 + x2) / 2.0,
+                "y_c": (y1 + y2) / 2.0,
+                "label": class_id_to_label(int(child.get("classId", -1))),
+                "conf": score,
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "width": width,
+                "height": height,
+                "area": width * height,
+            }
+        )
+    return center_list
+
+
+def detect_plate_from_children(children, min_secondary_conf=0.3, image_shape=None):
+    center_list = build_secondary_boxes_from_children(children, min_secondary_conf)
+    return _detect_plate_from_center_list(center_list, image_shape)

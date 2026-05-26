@@ -16,19 +16,24 @@ class ProcessAiHepper:
     @staticmethod
     def init_tracker(tracker_type="bytetrack", threshold=0.25, fps=15):
         # "bytetrack" | "botsort"
+        # high_conf_det_threshold must be <= threshold, otherwise no detection
+        # ever counts as "high-confidence" and no new track can be spawned.
+        high_conf = max(0.1, threshold - 0.1)
         if tracker_type == "botsort":
             tracker = BoTSORTTracker(
                 track_activation_threshold=threshold,
                 lost_track_buffer=30,
                 frame_rate=fps,
-                minimum_consecutive_frames=2,
+                minimum_consecutive_frames=1,
+                high_conf_det_threshold=high_conf,
             )
         else:
             tracker = ByteTrackTracker(
                 track_activation_threshold=threshold,
                 lost_track_buffer=30,
                 frame_rate=fps,
-                minimum_consecutive_frames=2,
+                minimum_consecutive_frames=1,
+                high_conf_det_threshold=high_conf,
             )
         return tracker
 
