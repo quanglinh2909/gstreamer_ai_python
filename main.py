@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from app.core.config import settings
+from app.services.process_ai_service import process_ai_service
 
 logging.basicConfig(level=logging.INFO)
 
@@ -18,7 +20,9 @@ from app.models import ai_config  # noqa: F401 - đăng ký model vào Base.meta
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    threading.Thread(target=process_ai_service.start, daemon=True).start()
     yield
+    process_ai_service.stop()
 
 
 app = FastAPI(

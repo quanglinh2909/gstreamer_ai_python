@@ -56,6 +56,19 @@ class ProcessAiHepper:
         return polygons, ids_in_zone, exit_pending, entered_at, dwell_alerted
 
     @staticmethod
+    def update_tracker(tracker, detections, full_jpeg):
+        if isinstance(tracker, BoTSORTTracker):
+            frame = ProcessAiHepper.decode_frame(full_jpeg)
+            return tracker.update(detections, frame)
+        return tracker.update(detections)
+
+    @staticmethod
+    def decode_frame(full_jpeg):
+        if not full_jpeg:
+            return None
+        return cv2.imdecode(np.frombuffer(full_jpeg, np.uint8), cv2.IMREAD_COLOR)
+
+    @staticmethod
     def to_sv_detections(raw_detections):
         if not raw_detections:
             return sv.Detections(

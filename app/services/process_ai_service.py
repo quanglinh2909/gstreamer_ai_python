@@ -6,8 +6,14 @@ import sys
 import time
 
 import numpy as np
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-from app.services.camera_service import camera_service
+from app.core.config import settings
+from app.repositories.ai_config_repository import AIRepository
 from app.utils.process_ai_hepper import ProcessAiHepper
 
 
@@ -18,6 +24,7 @@ class ProcessAiService:
         self.running = False
         self.sock = None
         self.process_ai = {}
+        self._session_factory = None
 
     def recv_exact(self, sock, n):
         chunks, got = [], 0
@@ -51,7 +58,11 @@ class ProcessAiService:
             self._close_sock()
             return False
 
-    def _recv_loop(self):
+    async def _load_ai_config(self, camera_id, job_id):
+        async with self._session_factory() as db:
+            return await AIRepository.get_by_camera_and_job(db, camera_id, job_id)
+
+    async def _recv_loop(self):
         while self.running:
             try:
                 message = self.recv_message(self.sock)
@@ -68,7 +79,7 @@ class ProcessAiService:
             orig_height = meta.get("height")
 
             if camera_id not in self.process_ai or job_id not in self.process_ai[camera_id]:
-                ai_config = asyncio.run(camera_service.get_ai_config(camera_id, job_id))
+                ai_config = await self._load_ai_config(camera_id, job_id)
                 if ai_config is None:
                     print(
                         f"AI config not found for camera_id={camera_id}, job_id={job_id}",
@@ -77,8 +88,11 @@ class ProcessAiService:
                     continue
                 polygons, ids_in_zone, exit_pending, entered_at, dwell_alerted = \
                     ProcessAiHepper.prepare_zones(ai_config.polygons)
-                tracker = ProcessAiHepper.init_tracker(tracker_type=ai_config.tracker,
-                                                       threshold=ai_config.primary_conf, fps=ai_config.fps)
+                tracker = ProcessAiHepper.init_tracker(
+                    tracker_type=ai_config.tracker,
+                    threshold=ai_config.primary_conf,
+                    fps=ai_config.fps,
+                )
                 self.process_ai.setdefault(camera_id, {})[job_id] = {
                     "tracker": tracker,
                     "polygons": polygons,
@@ -105,7 +119,9 @@ class ProcessAiService:
                 service_ai = state["service_ai"]
 
                 detections = ProcessAiHepper.to_sv_detections(meta.get("detections", []))
-
+                detections = ProcessAiHepper.update_tracker(tracker, detections, full_jpeg)
+                if detections.tracker_id is None or len(detections) == 0:
+                    continue
                 detections = detections[detections.tracker_id >= 0]
 
                 now = time.time()
@@ -123,18 +139,27 @@ class ProcessAiService:
                     for tid in current_ids:
                         exit_pending[zone_idx].pop(tid, None)
                         if tid not in ids_in_zone[zone_idx]:
-                            print(f"ID {tid} ENTERED zone {zone_idx}")
+                            # print(f"ID {tid} ENTERED zone {zone_idx}")
+                            if service_ai is not None and hasattr(service_ai, "entered_zone"):
+                                service_ai.entered_zone(tid, meta, full_jpeg, now)
                             ids_in_zone[zone_idx].add(tid)
                             entered_at[zone_idx][tid] = now
                         elif dwell_seconds > 0 and tid not in dwell_alerted[zone_idx]:
                             if now - entered_at[zone_idx].get(tid, now) >= dwell_seconds:
-                                print(f"ID {tid} STAYED in zone {zone_idx} for {dwell_seconds}s")
+                                # print(f"ID {tid} STAYED in zone {zone_idx} for {dwell_seconds}s")
+                                if service_ai is not None and hasattr(service_ai, "dwell_alert"):
+                                    service_ai.dwell_alert(tid, meta, full_jpeg, now)
                                 dwell_alerted[zone_idx].add(tid)
+                        else:
+                            if service_ai is not None and hasattr(service_ai, "in_the_area"):
+                                service_ai.in_the_area(tid, meta, full_jpeg, now)
 
                     for tid in list(ids_in_zone[zone_idx] - current_ids):
                         exit_pending[zone_idx][tid] = exit_pending[zone_idx].get(tid, 0) + 1
                         if exit_pending[zone_idx][tid] >= fps:
-                            print(f"ID {tid} EXITED zone {zone_idx}")
+                            # print(f"ID {tid} EXITED zone {zone_idx}")
+                            if service_ai is not None and hasattr(service_ai, "exited_zone"):
+                                service_ai.exited_zone(tid, meta, full_jpeg, now)
                             ids_in_zone[zone_idx].discard(tid)
                             exit_pending[zone_idx].pop(tid, None)
                             entered_at[zone_idx].pop(tid, None)
@@ -148,18 +173,35 @@ class ProcessAiService:
                 pass
             self.sock = None
 
-    def start(self):
+    async def _run(self):
+        engine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
+        self._session_factory = async_sessionmaker(
+            bind=engine, class_=AsyncSession, expire_on_commit=False,
+        )
         self.running = True
-        while self.running:
-            if self._connect():
-                try:
-                    self._recv_loop()
-                finally:
-                    self._close_sock()
-            if self.running:
-                time.sleep(self.reconnect_delay)
+        try:
+            while self.running:
+                if self._connect():
+                    try:
+                        await self._recv_loop()
+                    finally:
+                        self._close_sock()
+                        self.process_ai.clear()
+                if self.running:
+                    await asyncio.sleep(self.reconnect_delay)
+        finally:
+            await engine.dispose()
+
+    def start(self):
+        try:
+            asyncio.run(self._run())
+        except Exception as exc:
+            print(f"process_ai_service crashed: {exc}", file=sys.stderr)
         return 0
 
     def stop(self):
         self.running = False
         self._close_sock()
+
+
+process_ai_service = ProcessAiService()
