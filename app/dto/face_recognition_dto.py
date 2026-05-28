@@ -10,6 +10,6 @@ class FaceRecognitionDTO(BaseModel):
     maxFps: int = 5
     enabled: bool = True
     polygons: str
-    tracker: Optional[str] = "bytetrack"
+    tracker: Optional[str] = "ocsort"
     overlap_threshold: Optional[float] = 0.30
     dwellSeconds: Optional[int] = 0

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-from typing import List, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.dto.identity_dto import IdentityResponse, IdentityWithFaceResponse
+from app.dto.pagination_dto import PageResponse
 from app.services.identity_service import identity_service
 
 router = APIRouter()
@@ -44,10 +45,20 @@ async def update_identity(
     )
 
 
-@router.get("", response_model=List[IdentityResponse])
-async def list_identities(db: AsyncSession = Depends(get_db)):
-    items = await identity_service.list_all(db)
-    return [IdentityResponse.model_validate(i) for i in items]
+@router.get("", response_model=PageResponse[IdentityResponse])
+async def list_identities(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=200),
+    name: Optional[str] = Query(None, description="Substring match on name (case-insensitive)"),
+    db: AsyncSession = Depends(get_db),
+):
+    items, total = await identity_service.list_paginated(db, page, size, name)
+    return PageResponse[IdentityResponse].build(
+        items=[IdentityResponse.model_validate(i) for i in items],
+        total=total,
+        page=page,
+        size=size,
+    )
 
 
 @router.get("/{identity_id}", response_model=IdentityResponse)
@@ -56,3 +67,9 @@ async def get_identity(identity_id: int, db: AsyncSession = Depends(get_db)):
     if identity is None:
         raise HTTPException(status_code=404, detail="Identity not found")
     return IdentityResponse.model_validate(identity)
+
+
+@router.delete("/{identity_id}", status_code=204)
+async def delete_identity(identity_id: int, db: AsyncSession = Depends(get_db)):
+    await identity_service.delete(db, identity_id)
+    return Response(status_code=204)

@@ -11,3 +11,6 @@ opencv-python
 numpy
 python-multipart
 pymilvus
+pymilvus[milvus_lite]
+uvicorn[standard]
+python-Levenshtein

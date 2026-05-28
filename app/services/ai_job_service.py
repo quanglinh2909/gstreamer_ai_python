@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,12 +11,17 @@ from app.repositories.ai_config_repository import AIRepository
 @dataclass(frozen=True)
 class AIJobSpec:
     config_type: str
-    transform_data: str
+    transform_data: Optional[str]
     name: str
     model_file_1: str
-    model_file_2: str
+    model_file_2: Optional[str]
     model_type_1: str
-    model_type_2: str
+    model_type_2: Optional[str]
+    # Comma-separated YOLO class IDs to keep, e.g. "0,1" for person+bicycle.
+    # Empty / None / "all" means keep every class. Matches C++ parseClassFilter
+    # in src/ai/Config.hpp — the engine drops detections whose cls_id isn't in
+    # the parsed set before any tracker / stage-2 work.
+    class_filter: Optional[str] = None
 
 
 class AIJobService:
@@ -27,11 +33,31 @@ class AIJobService:
         )
 
     @staticmethod
-    def _find_existing(ai_jobs, transform_data):
-        return next(
-            (j for j in ai_jobs if j["transformData"] == transform_data),
-            None,
+    def _find_existing(ai_jobs, spec):
+        """Locate the C++-side job that already represents this SPEC for
+        this camera so we PUT (update) instead of POSTing a duplicate.
+
+        Match by `name` first — it's unique per SPEC (face/plate/
+        restricted_area each carry a distinct label) and works even for
+        single-stage jobs whose `transformData` is empty. The C++ DTO
+        serialises a missing transform as "" not null, so a naive
+        `transformData == None` comparison always failed for
+        restricted_area and silently created a new duplicate every save.
+
+        Fall back to a transform match for backwards-compat with stage-2
+        cascade jobs (face / plate) that were saved before the rename."""
+        by_name = next(
+            (j for j in ai_jobs if j.get("name") == spec.name), None,
         )
+        if by_name is not None:
+            return by_name
+        if spec.transform_data:
+            return next(
+                (j for j in ai_jobs
+                 if j.get("transformData") == spec.transform_data),
+                None,
+            )
+        return None
 
     @staticmethod
     def _to_ratio(value: float) -> float:
@@ -42,12 +68,14 @@ class AIJobService:
         req.secondaryConf = self._to_ratio(req.secondaryConf)
 
         ai_jobs = await HTTPXClient.get(f"/cameras/{req.cameraId}/ai-jobs")
-        existing = self._find_existing(ai_jobs, spec.transform_data)
+        existing = self._find_existing(ai_jobs, spec)
 
         if existing:
             payload = req.model_dump(exclude_none=True, exclude={"polygons"})
             payload["primaryConf"] = 0.2
             payload["secondaryConf"] = 0.2
+            if spec.class_filter is not None:
+                payload["classFilter"] = spec.class_filter
             data = await HTTPXClient.put(f"/ai-jobs/{existing['id']}", json=payload)
         else:
             ai_models = await HTTPXClient.get("/ai-models")
@@ -60,6 +88,11 @@ class AIJobService:
             payload["name"] = spec.name
             payload["primaryConf"] = 0.2
             payload["secondaryConf"] = 0.2
+            # Pass through to the C++ engine. Empty string means "keep all
+            # classes" (matches parseClassFilter); a CSV like "0,1" keeps
+            # only those YOLO ids — drops everything else at the engine
+            # before tracker / stage-2 work.
+            payload["classFilter"] = spec.class_filter or ""
             data = await HTTPXClient.post("/ai-jobs", json=payload)
 
         await AIRepository.create_or_update(
@@ -77,6 +110,12 @@ class AIJobService:
                 dwell_seconds=req.dwellSeconds,
             ),
         )
+        # Force the recv loop to reload tracker/polygons/thresholds for this
+        # (camera, job) instead of keeping the stale snapshot it cached on
+        # the first inbound message. Lazy import — avoids the
+        # ai_job_service ↔ process_ai_hepper ↔ face_recognition_service cycle.
+        from app.services.process_ai_service import process_ai_service
+        process_ai_service.invalidate(req.cameraId, data.get("id"))
         return data
 
     async def inference_model(

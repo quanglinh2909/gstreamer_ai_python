@@ -15,9 +15,10 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.app import api_router
-from app.core.database import Base, engine
+from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.milvus import close_client, get_client
-from app.models import ai_config, event_face, event_plate, identity  # noqa: F401 - đăng ký model vào Base.metadata
+from app.models import ai_config, event_face, event_plate, identity, plate_white_list, restricted_areas  # noqa: F401 - đăng ký model vào Base.metadata
+from app.services.plate_white_list_service import plate_white_list_service
 
 UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -27,6 +28,10 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # Prime the plate whitelist cache before the ALPR consumer thread
+    # starts so the very first detection can hit the in-memory map.
+    async with AsyncSessionLocal() as db:
+        await plate_white_list_service.load_all(db)
     get_client()
     threading.Thread(target=process_ai_service.start, daemon=True).start()
     yield
@@ -36,7 +41,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     docs_url="/",
-    root_path="/gstreamer-ai",
     openapi_url="/openapi.json",
     title="GStreamer AI API",
     lifespan=lifespan,

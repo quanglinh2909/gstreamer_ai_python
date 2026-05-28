@@ -4,6 +4,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.event_face import EventFace
+from app.models.identity import Identity
 
 
 class EventFaceRepository:
@@ -23,10 +24,16 @@ class EventFaceRepository:
         )
 
         result = await db.execute(
-            select(EventFace)
+            select(EventFace, Identity.name)
+            .outerjoin(Identity, EventFace.identity_id == Identity.id)
             .where(*filters)
             .order_by(EventFace.timestamp.desc(), EventFace.id.desc())
             .offset((page - 1) * size)
             .limit(size)
         )
-        return result.scalars().all(), int(total or 0)
+
+        events = []
+        for event, name in result.all():
+            event.name = name
+            events.append(event)
+        return events, int(total or 0)

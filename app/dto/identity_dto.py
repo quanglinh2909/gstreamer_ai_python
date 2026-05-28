@@ -8,15 +8,21 @@ class IdentityResponse(BaseModel):
 
     id: int
     name: str
+    image_full: Optional[str] = None
+    image_crop: Optional[str] = None
 
 
 class FaceInfo(BaseModel):
     id: int
     score: float
     embedding: List[float]
+    image_full: Optional[str] = None
+    image_crop: Optional[str] = None
 
 
 class IdentityWithFaceResponse(BaseModel):
     id: int
     name: str
+    image_full: Optional[str] = None
+    image_crop: Optional[str] = None
     face: Optional[FaceInfo] = None

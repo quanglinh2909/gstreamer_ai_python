@@ -11,6 +11,17 @@ class Settings(BaseSettings):
     MILVUS_FACE_COLLECTION: Optional[str] = "face_embeddings"
     FACE_EMBEDDING_DIM: Optional[int] = 512
 
+    # Face registration runs entirely in Python (YOLO pose → align → AdaFace
+    # RKNN) so the registration embedding matches the proven ai_result_face.py
+    # pipeline, independent of the C++ inference path used by live RTSP.
+    FACE_DETECTOR_MODEL_PATH: Optional[str] = \
+        "/home/orangepi/face_inspireface/weight/yolov8n-face_rknn_model_640"
+    FACE_EMBEDDING_MODEL_PATH: Optional[str] = \
+        "/home/orangepi/Documents/test/weights/adaface_ir101_fp16.rknn"
+    FACE_ALIGN_MODULE_PATH: Optional[str] = \
+        "/home/orangepi/Documents/AdaFace/align_face.py"
+    FACE_DETECT_CONF: Optional[float] = 0.5
+
     class Config:
         env_file = ".env"
 
