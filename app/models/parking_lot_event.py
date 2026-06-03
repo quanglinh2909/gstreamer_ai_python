@@ -24,4 +24,7 @@ class ParkingLotEvent(Base):
     plate_number: Mapped[str] = mapped_column(String(32), nullable=False)
     face_camera_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     plate_camera_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Full-frame snapshots captured at match time, one per paired camera.
+    face_image_full: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    plate_image_full: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     timestamp: Mapped[int] = mapped_column(nullable=False)

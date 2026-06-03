@@ -249,6 +249,7 @@ class PlateRecognitionService:
                 "plate": t.upper(),
                 "timestamp": timestamp,
                 "camera_id": meta["cameraId"],
+                "full_jpeg": full_jpeg,
             })
         # Already confirmed and saved on an earlier frame: keep reading and
         # firing the whitelist above, but don't write a duplicate EventPlate.

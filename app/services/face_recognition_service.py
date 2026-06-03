@@ -289,19 +289,21 @@ class FaceRecognitionService:
         similarity = 0.0
         embedding = self._extract_embedding(parent)
         if embedding:
-            identity_id, similarity = await self._match_identity(embedding, secondary_conf)
+            _identity_id, _similarity = await self._match_identity(embedding, 0.15)
+            if _identity_id is not None:
+                task_parking_lot.add_task({
+                    "task": "face_recognition",
+                    "identity_id": _identity_id,
+                    # "similarity": _similarity,
+                    "timestamp": timestamp,
+                    "camera_id": meta["cameraId"],
+                    "full_jpeg": full_jpeg,
+                })
+            if _similarity >= secondary_conf:
+                identity_id, similarity = _identity_id, _similarity
 
         if identity_id is None and not save_unmatched:
             return None
-        
-        if identity_id is not None:
-            task_parking_lot.add_task({
-                "task": "face_recognition",
-                "identity_id": identity_id,
-                # "similarity": similarity,
-                "timestamp": timestamp,
-                "camera_id": meta["cameraId"],
-            })
 
         # Already identified on a previous frame: keep returning the match so
         # the tracker stays RESOLVED, but don't write another EventFace row.

@@ -1,4 +1,6 @@
 import asyncio
+import datetime
+import os
 import time
 import traceback
 from queue import Queue
@@ -15,6 +17,12 @@ from app.models.parking_lot_event import ParkingLotEvent
 from app.services.parking_lot_service import parking_lot_service
 from app.services.identity_plate_service import identity_plate_service
 
+# Project-root /uploads — same directory mounted as static in main.py.
+UPLOADS_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "uploads",
+)
+
 
 class TaskParkingLot:
     TIME_EXPIRED = 20  # thời gian lưu trữ thông tin (giây)
@@ -28,29 +36,56 @@ class TaskParkingLot:
         # async engine (asyncpg ties connections to the loop that made them).
         self._session_factory = None
 
-    async def valid_success(self, camera_id, identity_id, plate_number):
-        print(f"Valid success for camera {camera_id}")
-        # Persist the gate-open event, then physically open the barrier.
-        await self._persist_event(camera_id, identity_id, plate_number)
-        await asyncio.to_thread(self._open_barrier, camera_id)
+    async def valid_success(self, lot, identity_id, plate_number, face_jpeg, plate_jpeg):
+        lot_id = lot["id"] if lot else None
+        print(f"Valid success for parking lot {lot_id} (identity {identity_id}, plate {plate_number})")
+        # Save the two full-frame snapshots off the loop, persist, then open.
+        face_url = await asyncio.to_thread(
+            self._save_image_blocking, face_jpeg, lot_id, "face",
+        )
+        plate_url = await asyncio.to_thread(
+            self._save_image_blocking, plate_jpeg, lot_id, "plate",
+        )
+        await self._persist_event(
+            lot, identity_id, plate_number, face_url, plate_url,
+        )
+        await asyncio.to_thread(self._open_barrier, lot_id)
 
-    def _open_barrier(self, camera_id):
+    @staticmethod
+    def _save_image_blocking(jpeg, lot_id, kind):
+        if not jpeg:
+            return None
+        try:
+            date = datetime.date.today().isoformat()
+            folder_rel = os.path.join(
+                "parking", str(lot_id if lot_id is not None else "unknown"), date,
+            )
+            folder_abs = os.path.join(UPLOADS_ROOT, folder_rel)
+            os.makedirs(folder_abs, exist_ok=True)
+            stem = f"{int(time.time() * 1000)}_{kind}"
+            with open(os.path.join(folder_abs, f"{stem}.jpg"), "wb") as fp:
+                fp.write(jpeg)
+            return f"/uploads/{folder_rel}/{stem}.jpg"
+        except Exception as e:
+            print(f"parking image save error: {e}")
+            return None
+
+    def _open_barrier(self, lot_id):
         data_send = {"io_pin": 5}
         try:
             requests.post(
                 "http://localhost:8087/barrier/open", json=data_send, timeout=5.0,
             )
             # response.raise_for_status()
-            print(f"Barrier opened for camera {camera_id}")
+            print(f"Barrier opened for parking lot {lot_id}")
         except Exception as e:
-            print(f"Failed to open barrier for camera {camera_id}: {e}")
+            print(f"Failed to open barrier for parking lot {lot_id}: {e}")
 
-    async def _persist_event(self, camera_id, identity_id, plate_number):
+    async def _persist_event(
+        self, lot, identity_id, plate_number, face_url, plate_url,
+    ):
         if self._session_factory is None:
             return
-        # camera_id is whichever side triggered the match; the lot carries both
-        # paired cameras so we store the full context regardless.
-        lot = parking_lot_service.get_by_camera_id(camera_id)
         try:
             async with self._session_factory() as db:
                 event = ParkingLotEvent(
@@ -59,6 +94,8 @@ class TaskParkingLot:
                     plate_number=plate_number,
                     face_camera_id=lot["face_camera_id"] if lot else None,
                     plate_camera_id=lot["plate_camera_id"] if lot else None,
+                    face_image_full=face_url,
+                    plate_image_full=plate_url,
                     timestamp=int(time.time()),
                 )
                 db.add(event)
@@ -111,6 +148,7 @@ class TaskParkingLot:
             identity_id = task.get("identity_id")
             timestamp = task.get("timestamp")
             camera_id = task.get("camera_id")
+            full_jpeg = task.get("full_jpeg")
             key = f"{identity_id}_{camera_id}"
             _camera_plate = parking_lot_service.get_plate_camera(camera_id)
 
@@ -118,19 +156,28 @@ class TaskParkingLot:
                 print(f"Face {identity_id} from camera {camera_id} already processed or no plate camera linked")
                 return
 
+            lot = parking_lot_service.get_by_camera_id(camera_id)
             _plates = identity_plate_service.get_by_identity_id(identity_id)
             for plate_number in _plates:
                 plate_key = f"{plate_number}_{_camera_plate}"
                 if plate_key in self.plates:
-                    await self.valid_success(camera_id, identity_id, plate_number)
+                    await self.valid_success(
+                        lot, identity_id, plate_number,
+                        full_jpeg, self.plates[plate_key].get("full_jpeg"),
+                    )
                     break
             print(f"Registering face {identity_id} from camera {camera_id}")
-            self.faces[key] = {"timestamp": timestamp, "camera_id": camera_id}
+            self.faces[key] = {
+                "timestamp": timestamp,
+                "camera_id": camera_id,
+                "full_jpeg": full_jpeg,
+            }
 
         elif name_task == "plate_recognition":
             plate = task.get("plate")
             timestamp = task.get("timestamp")
             camera_id = task.get("camera_id")
+            full_jpeg = task.get("full_jpeg")
             _camera_face = parking_lot_service.get_face_camera(camera_id)
             # Fuzzy match so a 1-2 char OCR slip still maps to the right
             # registered plate instead of dropping the event.
@@ -148,11 +195,19 @@ class TaskParkingLot:
                 print(f"Plate {plate_number} from camera {camera_id} already processed")
                 return
 
+            lot = parking_lot_service.get_by_camera_id(camera_id)
             _face_key = f"{_identity_id}_{_camera_face}"
             if _face_key in self.faces:
-                await self.valid_success(camera_id, _identity_id, plate_number)
+                await self.valid_success(
+                    lot, _identity_id, plate_number,
+                    self.faces[_face_key].get("full_jpeg"), full_jpeg,
+                )
             print(f"Registering plate {plate_number} from camera {camera_id}")
-            self.plates[key] = {"timestamp": timestamp, "camera_id": camera_id}
+            self.plates[key] = {
+                "timestamp": timestamp,
+                "camera_id": camera_id,
+                "full_jpeg": full_jpeg,
+            }
 
     def add_task(self, task):
         self.task_queue.put(task)

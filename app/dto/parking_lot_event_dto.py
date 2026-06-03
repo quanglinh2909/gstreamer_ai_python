@@ -14,4 +14,6 @@ class ParkingLotEventResponse(BaseModel):
     plate_number: str
     face_camera_id: Optional[str] = None
     plate_camera_id: Optional[str] = None
+    face_image_full: Optional[str] = None
+    plate_image_full: Optional[str] = None
     timestamp: int
