@@ -14,20 +14,33 @@ from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.models.event_plate import EventPlate
 from app.repositories.event_plate_repository import EventPlateRepository
 from app.services.ai_job_service import AIJobSpec, ai_job_service
+from app.tasks.task_parking_lot import task_parking_lot
 from app.utils.image_crop import fixed_size_crop
 from app.utils.plate_recognition_hepper import detect_plate_from_children
 from app.services.plate_white_list_service import plate_white_list_service
 from app.ws.plate_event_ws import plate_event_broadcaster
+
+# PLATE_SPEC = AIJobSpec(
+#     config_type=TypeConfigAiEnum.PLATE_RECOGNITION.value,
+#     transform_data="align_plate",
+#     name="plate recognition",
+#     model_file_1="plate_number_seg.rknn",
+#     model_file_2="ocr.rknn",
+#     model_type_1="yolov8_seg",
+#     model_type_2="yolov8_detect",
+# )
 
 PLATE_SPEC = AIJobSpec(
     config_type=TypeConfigAiEnum.PLATE_RECOGNITION.value,
     transform_data="align_plate",
     name="plate recognition",
     model_file_1="plate_number_seg.rknn",
-    model_file_2="ocr.rknn",
+    model_file_2="rf_detf_ocr.rknn",
     model_type_1="yolov8_seg",
-    model_type_2="yolov8_detect",
+    model_type_2="rf_detect",
 )
+
+
 
 # Per-tracker confirmation state. entered_zone seeds it, in_the_area drives
 # the retry loop until a long-enough plate string is read, exited_zone
@@ -110,7 +123,7 @@ class PlateRecognitionService:
     # the single-row Vietnamese car plate (470×110 mm = 4.27:1) so most
     # crops fill the frame cleanly; 2-row motorbike plates (~1.4:1) get
     # source-extended horizontally and centred — never stretched.
-    CROP_OUTPUT_W = 480
+    CROP_OUTPUT_W = 280
     CROP_OUTPUT_H = 120
     CROP_PAD_COLOR = 114  # YOLO-style neutral grey for letterbox fill
 
@@ -204,12 +217,17 @@ class PlateRecognitionService:
             print(f"plate persist error: {exc}", file=sys.stderr)
 
     def _try_confirm_plate(self, meta, parent, full_jpeg, timestamp, secondary_conf,
-                           key, log_label):
+                           key, log_label, persist: bool = True):
         """Read the plate text from the detection's OCR children. Returns
-        True when the plate is confirmed (len >= _PLATE_MIN_LEN) and a
-        persist task was scheduled, False when we still need more frames.
-        Also fires the whitelist/barrier task for any partial read above
-        the looser whitelist threshold — independent of DB persistence."""
+        True when the plate is confirmed (len >= _PLATE_MIN_LEN), False when
+        we still need more frames. Also fires the whitelist/barrier task for
+        any partial read above the looser whitelist threshold — independent
+        of DB persistence.
+
+        When `persist` is False the OCR read and whitelist/barrier still run
+        (so the gate keeps working every frame) but no EventPlate row is
+        written and the state is left untouched — used once the tracker is
+        already RESOLVED to avoid duplicate saves."""
         text_plate = detect_plate_from_children(
             parent.get("children", []), secondary_conf,
         )
@@ -218,12 +236,24 @@ class PlateRecognitionService:
         t = self._clean_plate(text_plate)
         # Partial reads still useful for the whitelist (gate open) — the
         # whitelist service itself rate-limits duplicate hits per plate.
+        
         if len(t) >= _PLATE_WHITELIST_MIN_LEN:
             asyncio.create_task(
                 plate_white_list_service.process_ai_result(text_plate)
             )
         if len(t) < _PLATE_MIN_LEN:
             return False
+
+        task_parking_lot.add_task({
+                "task": "plate_recognition",
+                "plate": t.upper(),
+                "timestamp": timestamp,
+                "camera_id": meta["cameraId"],
+            })
+        # Already confirmed and saved on an earlier frame: keep reading and
+        # firing the whitelist above, but don't write a duplicate EventPlate.
+        if not persist:
+            return True
         # Confirmed — flip state synchronously before launching the async
         # save so the very next frame's in_the_area sees _RESOLVED and
         # doesn't schedule a duplicate persist.
@@ -257,17 +287,18 @@ class PlateRecognitionService:
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf):
         key = (str(meta["cameraId"]), int(id))
-        # Only retry while entered_zone (or a previous in_the_area attempt)
-        # left the plate unconfirmed. Once _RESOLVED we never persist
-        # again — avoids double-saves per car / per zone visit.
-        if self._track_state.get(key) != _PENDING:
+        state = self._track_state.get(key)
+        # Ignore trackers that never entered the zone.
+        if state is None:
             return
         parent = self._find_parent(meta, id)
         if parent is None:
             return
+        # _PENDING -> still confirming, persist on success. _RESOLVED -> keep
+        # reading/whitelisting every frame but don't save a duplicate row.
         self._try_confirm_plate(
             meta, parent, full_jpeg, timestamp, secondary_conf,
-            key, "in_the_area",
+            key, "in_the_area", persist=(state == _PENDING),
         )
 
 

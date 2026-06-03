@@ -17,8 +17,11 @@ from fastapi.staticfiles import StaticFiles
 from app.app import api_router
 from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.milvus import close_client, get_client
-from app.models import ai_config, event_face, event_plate, identity, plate_white_list, restricted_areas  # noqa: F401 - đăng ký model vào Base.metadata
+from app.models import ai_config, event_face, event_plate, identity, identity_plate, parking_lot, plate_white_list, restricted_areas  # noqa: F401 - đăng ký model vào Base.metadata
+from app.services.identity_plate_service import identity_plate_service
+from app.services.parking_lot_service import parking_lot_service
 from app.services.plate_white_list_service import plate_white_list_service
+from app.tasks.task_parking_lot import task_parking_lot
 
 UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -32,8 +35,12 @@ async def lifespan(app: FastAPI):
     # starts so the very first detection can hit the in-memory map.
     async with AsyncSessionLocal() as db:
         await plate_white_list_service.load_all(db)
+        await parking_lot_service.load_all(db)
+        await identity_plate_service.load_all(db)
     get_client()
     threading.Thread(target=process_ai_service.start, daemon=True).start()
+    # Drains the face/plate task queue and correlates them per parking lot.
+    threading.Thread(target=task_parking_lot.worker, daemon=True).start()
     yield
     process_ai_service.stop()
     close_client()

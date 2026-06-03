@@ -12,6 +12,9 @@ DEFAULT_OCR_LABELS = [
     "A", "B", "C", "D", "E", "F", "G", "H", "K", "L", "M", "N", "P", "R", "S", "T", "U", "V", "X", "Y", "Z",
 ]
 
+# DEFAULT_OCR_LABELS = ['OCR','1', '2', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'K', 'L', 'M', '3', 'N', 'P', 'S', 'T', 'U', 'V', 'X', 'Y', 'Z', '0', '4', '5', '6', '7', '8', '9', 'A']
+
+
 CONFUSED_TO_DIGIT = {
     "O": "0",
     "Q": "0",
@@ -256,11 +259,37 @@ def _choose_best_line_candidate(line_boxes, expected_length, validator, image_sh
 
 
 def _split_lines(center_list):
-    y_mean = int(sum(c["y_c"] for c in center_list) / len(center_list))
+    """Split characters into the top (line_1) and bottom (line_2) rows.
+
+    Rows are separated by each centre's position relative to a least-squares
+    baseline fitted through all character centres (``row_pos = y_c - slope*x_c``)
+    instead of a flat horizontal cut at ``y_mean``. On a tilted two-line plate a
+    flat cut misassigns characters near the boundary — the higher end of the top
+    row can dip below the lower end of the bottom row — so de-tilting first keeps
+    each row intact. For a level plate ``slope`` is ~0 and this reduces to the
+    old horizontal split.
+    """
+    n = len(center_list)
+    if n == 0:
+        return [], []
+
+    xs = [c["x_c"] for c in center_list]
+    ys = [c["y_c"] for c in center_list]
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    slope = 0.0
+    if denom > 1e-6:
+        slope = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n)) / denom
+
+    # Vertical position after removing the plate's tilt; split at the midpoint.
+    row_positions = [ys[i] - slope * xs[i] for i in range(n)]
+    split = (max(row_positions) + min(row_positions)) / 2.0
+
     line_1 = []
     line_2 = []
-    for item in center_list:
-        if int(item["y_c"]) > y_mean:
+    for item, pos in zip(center_list, row_positions):
+        if pos > split:
             line_2.append(item)
         else:
             line_1.append(item)
@@ -315,6 +344,54 @@ def build_secondary_boxes(det, min_secondary_conf):
     return center_list, image_shape
 
 
+def _classify_lp_type(center_list):
+    """Decide 1-line ("1") vs 2-line ("2"), robust to tilt, to per-character
+    wobble, and to stray high/low noise boxes.
+
+    De-tilt the centres (row_pos = y_c - slope*x_c from a least-squares fit),
+    then look for a single clear horizontal GAP that splits them into two rows.
+    A real two-line plate has a gap of roughly one character height with several
+    characters on BOTH sides. A single-line plate has no such balanced gap —
+    even a stray box sitting high or low only puts ONE character across the gap,
+    so requiring >=2 characters on each side stops one outlier from turning a
+    single line into a (wrong) two-line read. (The earlier spread/median test
+    misfired here: one outlier inflated the spread and flipped it to 2-line.)
+    """
+    n = len(center_list)
+    if n < 4:
+        return "1"  # VN two-line plates carry >=3 (top) + 5 (bottom) characters
+
+    xs = [b["x_c"] for b in center_list]
+    ys = [b["y_c"] for b in center_list]
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    slope = 0.0
+    if denom > 1e-6:
+        slope = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n)) / denom
+
+    heights = sorted(b["height"] for b in center_list)
+    mid = len(heights) // 2
+    median_h = heights[mid] if len(heights) % 2 else (heights[mid - 1] + heights[mid]) / 2.0
+    if median_h <= 0:
+        return "1"
+
+    row_pos = sorted(ys[i] - slope * xs[i] for i in range(n))
+    best_gap = 0.0
+    best_index = 0
+    for i in range(n - 1):
+        gap = row_pos[i + 1] - row_pos[i]
+        if gap > best_gap:
+            best_gap = gap
+            best_index = i
+
+    top_count = best_index + 1
+    bottom_count = n - top_count
+    if best_gap > 0.6 * median_h and top_count >= 2 and bottom_count >= 2:
+        return "2"
+    return "1"
+
+
 def _detect_plate_from_center_list(center_list, image_shape):
     if not center_list:
         return ""
@@ -324,24 +401,7 @@ def _detect_plate_from_center_list(center_list, image_shape):
     if not center_list:
         return ""
 
-    lp_type = "1"
-    l_point = center_list[0]
-    r_point = center_list[0]
-    for cp in center_list:
-        if cp["x_c"] < l_point["x_c"]:
-            l_point = cp
-        if cp["x_c"] > r_point["x_c"]:
-            r_point = cp
-
-    if l_point["x_c"] != r_point["x_c"]:
-        for ct in center_list:
-            if not check_point_linear(
-                    ct["x_c"], ct["y_c"],
-                    l_point["x_c"], l_point["y_c"],
-                    r_point["x_c"], r_point["y_c"],
-            ):
-                lp_type = "2"
-                break
+    lp_type = _classify_lp_type(center_list)
 
     return _build_plate_text(center_list, lp_type, image_shape)
 

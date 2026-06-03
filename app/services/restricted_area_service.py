@@ -20,15 +20,26 @@ from app.ws.restricted_area_event_ws import restricted_area_event_broadcaster
 # "0,1" tells the C++ engine to drop every YOLO class except 0 and 1
 # before tracking — keeps unrelated objects out of the restricted-area
 # events entirely, no Python-side filter needed.
+# RESTRICTED_AREA_SPEC = AIJobSpec(
+#     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
+#     transform_data=None,
+#     name="restricted area",
+#     model_file_1="yolov8.rknn",
+#     model_file_2=None,
+#     model_type_1="yolov8_detect",
+#     model_type_2=None,
+#     class_filter="0",
+# )
+
 RESTRICTED_AREA_SPEC = AIJobSpec(
     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
     transform_data=None,
     name="restricted area",
-    model_file_1="yolov8.rknn",
+    model_file_1="rf_detr_m.rknn",
     model_file_2=None,
-    model_type_1="yolov8_detect",
+    model_type_1="rf_detect",
     model_type_2=None,
-    class_filter="0",
+    class_filter="1",
 )
 
 UPLOADS_ROOT = os.path.join(

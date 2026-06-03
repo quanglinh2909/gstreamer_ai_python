@@ -19,6 +19,7 @@ from app.models.identity import Identity
 from app.repositories.event_face_repository import EventFaceRepository
 from app.repositories.face_vector_repository import FaceVectorRepository
 from app.services.ai_job_service import AIJobSpec, ai_job_service
+from app.tasks.task_parking_lot import task_parking_lot
 from app.utils import face_embedder
 from app.utils.image_crop import fixed_size_crop
 from app.ws.face_event_ws import face_event_broadcaster
@@ -268,13 +269,17 @@ class FaceRecognitionService:
     async def _persist_event(
         self, meta, parent, full_jpeg, tid, timestamp, secondary_conf,
         save_unmatched: bool,
+        persist: bool = True,
     ):
         """Run identification and (optionally) write one EventFace row.
 
         Returns the matched identity_id, or None if no match passed the
         threshold. When `save_unmatched` is False, an unmatched result is
         not written to the DB — the caller keeps the tracker in PENDING
-        state so the next frame retries."""
+        state so the next frame retries. When `persist` is False the match
+        still runs (so the caller can keep re-identifying every frame) but
+        nothing is written to the DB — used once the tracker is already
+        RESOLVED to avoid duplicate EventFace rows."""
         from app.services.process_ai_service import process_ai_service
         session_factory = process_ai_service._session_factory
         if session_factory is None:
@@ -287,6 +292,23 @@ class FaceRecognitionService:
             identity_id, similarity = await self._match_identity(embedding, secondary_conf)
 
         if identity_id is None and not save_unmatched:
+            return None
+        
+        if identity_id is not None:
+            task_parking_lot.add_task({
+                "task": "face_recognition",
+                "identity_id": identity_id,
+                # "similarity": similarity,
+                "timestamp": timestamp,
+                "camera_id": meta["cameraId"],
+            })
+
+        # Already identified on a previous frame: keep returning the match so
+        # the tracker stays RESOLVED, but don't write another EventFace row.
+        if not persist:
+            return identity_id
+
+        if not identity_id:
             return None
 
         try:
@@ -336,12 +358,14 @@ class FaceRecognitionService:
     async def _run_match(
         self, meta, parent, full_jpeg, tid, timestamp, secondary_conf,
         save_unmatched: bool,
+        persist: bool = True,
     ):
         key = (str(meta["cameraId"]), int(tid))
         try:
             identity_id = await self._persist_event(
                 meta, parent, full_jpeg, tid, timestamp, secondary_conf,
                 save_unmatched=save_unmatched,
+                persist=persist,
             )
             # If the tracker has already been cleared by exited_zone while
             # we were matching, don't resurrect the entry.
@@ -369,17 +393,22 @@ class FaceRecognitionService:
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf):
         key = (str(meta["cameraId"]), int(id))
-        # Only retry when the previous attempt finished without a match.
-        # _MATCHING (still in flight) or _RESOLVED (already identified) skip.
-        if self._track_state.get(key) != _PENDING:
+        # Keep re-identifying every frame, but skip while a match is already in
+        # flight to avoid spawning overlapping tasks. RESOLVED keeps running —
+        # the match just won't be persisted again (persist=False below).
+        if self._track_state.get(key) == _MATCHING:
             return
         parent = self._find_parent(meta, id)
         if parent is None:
             return
+        # Already identified once -> run the match but don't write a duplicate
+        # EventFace row.
+        already_resolved = self._track_state.get(key) == _RESOLVED
         self._track_state[key] = _MATCHING
         asyncio.create_task(
             self._run_match(meta, parent, full_jpeg, id, timestamp,
-                            secondary_conf, save_unmatched=False)
+                            secondary_conf, save_unmatched=False,
+                            persist=not already_resolved)
         )
 
     def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf):

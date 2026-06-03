@@ -12,10 +12,11 @@ from app.repositories.plate_white_list_repository import PlateWhiteListRepositor
 
 
 def _normalize(plate_number: str) -> str:
-    # Plates are typically compared case- and whitespace-insensitively. Store
-    # them canonical (upper-case, no surrounding spaces) so lookups against
-    # detected plates from ALPR don't miss because of trivial formatting.
-    return plate_number.strip().upper()
+    # Keep only letters and digits, upper-cased — drop spaces, dots, dashes
+    # and every other symbol so every lookup path (is_whitelisted, the cache
+    # keys and process_ai_result) compares plates the same canonical way and
+    # doesn't miss because of trivial OCR formatting differences.
+    return re.sub(r"[^A-Za-z0-9]", "", plate_number or "").upper()
 
 
 def _clean_name(name: Optional[str]) -> Optional[str]:
@@ -43,7 +44,7 @@ class PlateWhiteListService:
         to wait on I/O."""
         rows = await PlateWhiteListRepository.list_all(db)
         with self._cache_lock:
-            self.plate_white_list = {row.plate_number: {} for row in rows}
+            self.plate_white_list = {_normalize(row.plate_number): {} for row in rows}
         print(f"[plate whitelist] loaded {len(self.plate_white_list)} entries")
 
     def is_whitelisted(self, plate_number: str) -> bool:
@@ -131,14 +132,28 @@ class PlateWhiteListService:
             self.plate_white_list.pop(plate, None)
     
     async def process_ai_result(self, plate_number: str):
-        plate_number = re.sub(r'[^a-zA-Z0-9À-ỹ\s]', '', plate_number or "").upper()
-        for key in self.plate_white_list.keys():
-            now = time.time()
-            pre_time = self.plate_white_list[key].get("last_matched", 0)
-            _key = re.sub(r'[^a-zA-Z0-9À-ỹ\s]', '', key or "").upper()
+        plate_number = _normalize(plate_number)
+        now = time.time()
+        # Snapshot under the lock: API handlers (FastAPI thread) mutate this
+        # dict via create/update/delete while we run on the recv-loop thread,
+        # so iterating it directly risks "dict changed size during iteration".
+        with self._cache_lock:
+            snapshot = [
+                (key, meta.get("last_matched", 0))
+                for key, meta in self.plate_white_list.items()
+            ]
+        for key, pre_time in snapshot:
+            _key = _normalize(key)
             if Levenshtein.distance(plate_number, _key) <= 2 and now - pre_time > 10:
+                # Re-check + stamp under the lock; the entry may have been
+                # removed by a concurrent delete since the snapshot, and the
+                # stamp also rate-limits the next match (>10s apart).
+                with self._cache_lock:
+                    entry = self.plate_white_list.get(key)
+                    if entry is None:
+                        continue
+                    entry["last_matched"] = now
                 print(f"Plate {plate_number} matched whitelist entry {key} with distance {Levenshtein.distance(plate_number, _key)}")
-                self.plate_white_list[key]["last_matched"] = now
                 async with httpx.AsyncClient() as client:
                     try:
                         response = await client.post(

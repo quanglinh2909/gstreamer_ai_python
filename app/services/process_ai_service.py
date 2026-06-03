@@ -39,7 +39,7 @@ class ProcessAiService:
         # is connected do we stash the latest meta+jpeg+polygons.
         self._debug_lock = threading.Lock()
         self._debug_subscribers: dict = {}   # (cam, job) -> refcount
-        self._debug_latest: dict = {}        # (cam, job) -> {meta, full_jpeg, seq, polygons}
+        self._debug_latest: dict = {}        # (cam, job) -> {meta, full_jpeg, seq, polygons, primary_conf}
         # Dedup the "AI config not found" warning: C++ engine workers that
         # never had a Python-side AIConfig (typically orphan jobs left
         # behind by the old duplicate-on-save bug) would otherwise spam
@@ -85,7 +85,8 @@ class ProcessAiService:
             hit = self._debug_latest.get((str(camera_id), str(job_id)))
             return dict(hit) if hit else None
 
-    def _stash_debug_frame(self, camera_id, job_id, meta, full_jpeg, polygons) -> None:
+    def _stash_debug_frame(self, camera_id, job_id, meta, full_jpeg, polygons,
+                           primary_conf=0.3) -> None:
         """Hot path. Returns immediately when nobody is debugging this
         (cam, job). Stores references only — no copies — because the
         recv loop is done mutating `meta` by the time this is called and
@@ -111,6 +112,7 @@ class ProcessAiService:
                 "full_jpeg": full_jpeg,
                 "seq": meta.get("seq", 0),
                 "polygons": polygons,
+                "primary_conf": primary_conf,
             }
 
     def _drain_invalidations(self) -> None:
@@ -229,6 +231,7 @@ class ProcessAiService:
                     "dwell_seconds": ai_config.dwell_seconds or 0,
                     "service_ai": ProcessAiHepper.get_service_ai(ai_config.type),
                     "secondary_conf": ai_config.secondary_conf,
+                    "primary_conf": ai_config.primary_conf,
                     "ai_type": ai_config.type,
                 }
             else:
@@ -244,6 +247,7 @@ class ProcessAiService:
                 dwell_seconds = state["dwell_seconds"]
                 service_ai = state["service_ai"]
                 secondary_conf = state["secondary_conf"]
+                primary_conf = state.get("primary_conf", 0.3)
                 ai_type = state.get("ai_type")
 
                 detections = ProcessAiHepper.to_sv_detections(meta.get("detections", []))
@@ -255,7 +259,7 @@ class ProcessAiService:
                     # raw frame to any debug subscriber so they can see
                     # the model's pre-tracker output (helps spot tracker
                     # over-filtering). Cheap no-op when nobody's watching.
-                    self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons)
+                    self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons, primary_conf)
                     continue
                 detections = detections[detections.tracker_id >= 0]
 
@@ -274,7 +278,7 @@ class ProcessAiService:
 
                 # Stash with tracker_ids tagged onto raw_dets, so the
                 # MJPEG overlay can show them.
-                self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons)
+                self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons, primary_conf)
 
                 now = time.time()
                 for zone_idx, polygon in enumerate(polygons):

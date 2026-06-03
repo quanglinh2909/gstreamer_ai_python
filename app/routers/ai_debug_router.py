@@ -57,9 +57,12 @@ async def mjpeg(camera_id: str, job_id: str):
 
                 # OpenCV encode is CPU-bound — punt to the threadpool so
                 # we don't stall other FastAPI requests.
+                # Use the job's own primary_conf as the overlay's display
+                # filter so the drawn boxes match what the pipeline keeps.
                 annotated = await asyncio.to_thread(
                     draw_overlay,
                     frame["meta"], frame["full_jpeg"], frame["polygons"],
+                    frame.get("primary_conf", 0.3),
                 )
                 if not annotated:
                     # draw_overlay refuses unrenderable frames (empty

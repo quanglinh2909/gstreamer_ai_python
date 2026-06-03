@@ -24,6 +24,13 @@ _FONT = cv2.FONT_HERSHEY_SIMPLEX
 _FONT_SCALE = 1.2
 _FONT_THICKNESS = 3
 
+# Fallback confidence floor for the debug overlay when the caller passes none.
+# NMS-free detectors (e.g. RF-DETR) emit many low-score boxes; drawing all of
+# them clutters the view. The router passes the job's own primary_conf as
+# min_score, so the overlay matches what the pipeline actually keeps. This is a
+# *display-only* filter; it changes nothing in the AI pipeline or its events.
+_DEFAULT_MIN_SCORE = 0.3
+
 
 def _det_in_any_zone(bbox, polygons) -> bool:
     """True when the detection counts as 'in zone' by the same rule the
@@ -59,7 +66,8 @@ def _draw_label(img, text, x, y, bg_color):
                 _LABEL_TEXT_COLOR, _FONT_THICKNESS, cv2.LINE_AA)
 
 
-def draw_overlay(meta: dict, full_jpeg: bytes, polygons) -> bytes:
+def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
+                 min_score: float = _DEFAULT_MIN_SCORE) -> bytes:
     # Defensive: process_ai_service already filters empty jpegs out, but
     # a race or future code path could still reach us with no bytes.
     # `imdecode` asserts on an empty buffer, which would tear the whole
@@ -79,6 +87,10 @@ def draw_overlay(meta: dict, full_jpeg: bytes, polygons) -> bytes:
             cv2.polylines(img, [pts], True, _ZONE_COLOR, 2)
 
     for det in meta.get("detections", []):
+        # Display-only confidence filter — skip low-score boxes so NMS-free
+        # detectors don't clutter the debug view (see _DEFAULT_MIN_SCORE).
+        if float(det.get("score", 0.0)) < min_score:
+            continue
         x1 = int(det.get("x1", 0))
         y1 = int(det.get("y1", 0))
         x2 = int(det.get("x2", 0))
