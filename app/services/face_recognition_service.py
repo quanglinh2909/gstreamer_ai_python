@@ -249,9 +249,9 @@ class FaceRecognitionService:
         """Returns (identity_id, similarity). identity_id is None when no hit
         passes secondary_conf; similarity is the top score regardless, so the
         caller can persist it even on a miss."""
-        hits = await asyncio.to_thread(
-            FaceVectorRepository.search, embedding=embedding, top_k=3,
-        )
+        # In-memory cosine search (cache mirror of Milvus) — no gRPC round-trip
+        # on the per-frame hot path, so continuous matching stays cheap.
+        hits = FaceVectorRepository.search_cached(embedding=embedding, top_k=3)
         if not hits:
             return None, 0.0
         # Print top hits so we can see best vs runner-up gap. A small gap means
