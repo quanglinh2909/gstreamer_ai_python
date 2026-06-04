@@ -18,11 +18,12 @@ from app.app import api_router
 from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.milvus import close_client, get_client
 from app.repositories.face_vector_repository import FaceVectorRepository
-from app.models import ai_config, event_face, event_plate, identity, identity_plate, parking_lot, parking_lot_event, plate_white_list, restricted_areas  # noqa: F401 - đăng ký model vào Base.metadata
+from app.models import ai_config, event_face, event_plate, identity, identity_plate, parking_lot, parking_lot_event, plate_white_list, restricted_areas, system_metrics  # noqa: F401 - đăng ký model vào Base.metadata
 from app.services.identity_plate_service import identity_plate_service
 from app.services.parking_lot_service import parking_lot_service
 from app.services.plate_white_list_service import plate_white_list_service
 from app.tasks.task_parking_lot import task_parking_lot
+from app.tasks.task_system_metrics import task_system_metrics
 
 UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -45,8 +46,11 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=process_ai_service.start, daemon=True).start()
     # Drains the face/plate task queue and correlates them per parking lot.
     threading.Thread(target=task_parking_lot.worker, daemon=True).start()
+    # Samples CPU/temp/memory/load/NPU/RGA every 10s into rolling 1-month tables.
+    threading.Thread(target=task_system_metrics.worker, daemon=True).start()
     yield
     process_ai_service.stop()
+    task_system_metrics.stop()
     close_client()
 
 

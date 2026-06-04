@@ -7,6 +7,17 @@ from app.models.ai_config import AIConfig
 class AIRepository:
 
     @staticmethod
+    async def get_job_type_map(db: AsyncSession) -> dict:
+        """Map every saved C++ job_id to its AI type.
+
+        job_id is the canonical link between a C++ engine ai-job and the
+        Python-side type (same join camera_service uses), so callers can label
+        an engine job by type without relying on transformData/name.
+        """
+        result = await db.execute(select(AIConfig.job_id, AIConfig.type))
+        return {row[0]: row[1] for row in result.all()}
+
+    @staticmethod
     async def create_or_update(db: AsyncSession, payload: AIConfig):
         result = await db.execute(
             select(AIConfig).where(
