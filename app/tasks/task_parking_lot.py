@@ -5,7 +5,7 @@ import time
 import traceback
 from queue import Queue
 
-import requests
+from app.utils.orangepi_gpio import gpio_barrie_orangepi
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -71,11 +71,8 @@ class TaskParkingLot:
             return None
 
     def _open_barrier(self, lot_id):
-        data_send = {"io_pin": 5}
         try:
-            requests.post(
-                "http://localhost:8087/barrier/open", json=data_send, timeout=5.0,
-            )
+            gpio_barrie_orangepi.open_barrie(5)
             # response.raise_for_status()
             print(f"Barrier opened for parking lot {lot_id}")
         except Exception as e:
@@ -180,28 +177,34 @@ class TaskParkingLot:
             full_jpeg = task.get("full_jpeg")
             _camera_face = parking_lot_service.get_face_camera(camera_id)
             # Fuzzy match so a 1-2 char OCR slip still maps to the right
-            # registered plate instead of dropping the event.
-            _data = identity_plate_service.get_by_plate_fuzzy(plate)
-            _identity_id = _data.get("identity_id") if _data else None
+            # registered plate instead of dropping the event. The same plate can
+            # belong to several people, so this returns every matching identity.
+            _candidates = identity_plate_service.get_by_plate_fuzzy(plate)
 
-            if not _camera_face or not _identity_id:
+            if not _camera_face or not _candidates:
                 return
 
-            # Use the normalised plate number (alnum, upper) so the key matches
-            # the one the face branch builds from get_by_identity_id.
-            plate_number = _data["plate_number"]
+            # All candidates share the same normalised plate number (alnum,
+            # upper) so the key matches the one the face branch builds from
+            # get_by_identity_id.
+            plate_number = _candidates[0]["plate_number"]
             key = f"{plate_number}_{camera_id}"
             if key in self.plates:
                 print(f"Plate {plate_number} from camera {camera_id} already processed")
                 return
 
             lot = parking_lot_service.get_by_camera_id(camera_id)
-            _face_key = f"{_identity_id}_{_camera_face}"
-            if _face_key in self.faces:
-                await self.valid_success(
-                    lot, _identity_id, plate_number,
-                    self.faces[_face_key].get("full_jpeg"), full_jpeg,
-                )
+            # Open the barrier for whichever co-owner of the plate has a recent
+            # matching face — stop at the first hit.
+            for _data in _candidates:
+                _identity_id = _data["identity_id"]
+                _face_key = f"{_identity_id}_{_camera_face}"
+                if _face_key in self.faces:
+                    await self.valid_success(
+                        lot, _identity_id, plate_number,
+                        self.faces[_face_key].get("full_jpeg"), full_jpeg,
+                    )
+                    break
             print(f"Registering plate {plate_number} from camera {camera_id}")
             self.plates[key] = {
                 "timestamp": timestamp,

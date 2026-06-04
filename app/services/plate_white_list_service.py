@@ -6,6 +6,7 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 import time
+from app.utils.orangepi_gpio import gpio_barrie_orangepi
 
 from app.models.plate_white_list import PlateWhiteList
 from app.repositories.plate_white_list_repository import PlateWhiteListRepository
@@ -156,15 +157,11 @@ class PlateWhiteListService:
                 print(f"Plate {plate_number} matched whitelist entry {key} with distance {Levenshtein.distance(plate_number, _key)}")
                 async with httpx.AsyncClient() as client:
                     try:
-                        response = await client.post(
-                            "http://localhost:8087/barrier/open",
-                            json={"io_pin": 5},
-                            timeout=5.0,
-                        )
+                        gpio_barrie_orangepi.open_barrie(5)
                         # response.raise_for_status()
-                        print(f"Barrier opened for plate {key}")
-                    except httpx.HTTPError as e:
-                        print(f"Failed to open barrier for plate {key}: {e}")
+                        print(f"Barrier opened when plate {plate_number} matched whitelist entry {key}")
+                    except Exception as e:
+                        print(f"Failed to open barrier for plate {plate_number} matched whitelist entry {key}: {e}")
 
 
 

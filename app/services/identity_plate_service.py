@@ -1,6 +1,6 @@
 import re
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import Levenshtein
 from fastapi import HTTPException
@@ -28,11 +28,14 @@ def _to_dict(entry: IdentityPlate) -> Dict:
 
 class IdentityPlateService:
     def __init__(self):
-        # plate_number (normalised, UPPER) -> {id, identity_id, plate_number}.
+        # plate_number (normalised, UPPER) -> [{id, identity_id, plate_number}].
+        # A list, not a single dict: the same plate can be registered to more
+        # than one identity (no unique constraint on plate_number), e.g. a car
+        # shared by two people — both must stay resolvable.
         # Mirrors plate_white_list in PlateWhiteListService: an in-memory copy
         # so the ALPR pipeline can map a detected plate to its identity without
         # hitting the DB on every event. Lookups stay O(1).
-        self.identity_plates: Dict[str, Dict] = {}
+        self.identity_plates: Dict[str, List[Dict]] = {}
         # Cross-thread access: API handlers (FastAPI loop) mutate; the
         # process_ai_service thread reads on every detection.
         self._cache_lock = threading.RLock()
@@ -42,42 +45,49 @@ class IdentityPlateService:
         (after Base.metadata.create_all) so the first lookup doesn't have
         to wait on I/O."""
         rows = await IdentityPlateRepository.list_all(db)
+        grouped: Dict[str, List[Dict]] = {}
+        for row in rows:
+            grouped.setdefault(_normalize(row.plate_number), []).append(
+                _to_dict(row),
+            )
         with self._cache_lock:
-            self.identity_plates = {
-                _normalize(row.plate_number): _to_dict(row) for row in rows
-            }
-        print(f"[identity plate] loaded {len(self.identity_plates)} entries")
+            self.identity_plates = grouped
+        total = sum(len(v) for v in self.identity_plates.values())
+        print(f"[identity plate] loaded {total} entries")
 
-    def get_by_plate(self, plate_number: str) -> Optional[Dict]:
-        """Thread-safe O(1) lookup of the identity a plate belongs to."""
+    def get_by_plate(self, plate_number: str) -> List[Dict]:
+        """Thread-safe O(1) lookup of every identity a plate belongs to.
+        Returns an empty list when the plate is unknown."""
         normalized = _normalize(plate_number)
         with self._cache_lock:
-            return self.identity_plates.get(normalized)
+            return list(self.identity_plates.get(normalized, ()))
 
     def get_by_plate_fuzzy(
         self, plate_number: str, max_distance: int = 2,
-    ) -> Optional[Dict]:
+    ) -> List[Dict]:
         """Like get_by_plate but tolerant of OCR noise: tries an exact match
         first, then falls back to the closest registered plate within
-        `max_distance` edits (Levenshtein). Returns None when nothing is close
-        enough. To avoid false hits on short plates, the allowed distance is
-        capped at len // 4 (so a 4-char plate allows 0, an 8-char allows 2)."""
+        `max_distance` edits (Levenshtein). Returns every identity sharing the
+        matched plate (a plate can belong to more than one person), or an empty
+        list when nothing is close enough. To avoid false hits on short plates,
+        the allowed distance is capped at len // 4 (so a 4-char plate allows 0,
+        an 8-char allows 2)."""
         normalized = _normalize(plate_number)
         if not normalized:
-            return None
+            return []
         # Shorter plates get a tighter budget — 2 edits on a 4-char plate could
         # match a completely different vehicle.
         budget = min(max_distance, len(normalized) // 4)
         with self._cache_lock:
             exact = self.identity_plates.get(normalized)
             if exact is not None:
-                return exact
+                return list(exact)
             best, best_dist = None, budget + 1
             for key, data in self.identity_plates.items():
                 dist = Levenshtein.distance(normalized, key)
                 if dist < best_dist:
                     best, best_dist = data, dist
-            return best if best_dist <= budget else None
+            return list(best) if best is not None and best_dist <= budget else []
 
     def get_by_identity_id(self, identity_id: int) -> List[str]:
         """Thread-safe lookup of every cached plate number for an identity,
@@ -86,13 +96,30 @@ class IdentityPlateService:
         with self._cache_lock:
             return [
                 plate["plate_number"]
-                for plate in self.identity_plates.values()
+                for entries in self.identity_plates.values()
+                for plate in entries
                 if plate["identity_id"] == identity_id
             ]
 
     def all_cached(self) -> List[Dict]:
         with self._cache_lock:
-            return list(self.identity_plates.values())
+            return [
+                plate
+                for entries in self.identity_plates.values()
+                for plate in entries
+            ]
+
+    def _cache_remove(self, key: str, entry_id: int) -> None:
+        """Drop a single entry (by id) from the list under `key`, removing the
+        key entirely once its last entry is gone. Caller holds _cache_lock."""
+        entries = self.identity_plates.get(key)
+        if not entries:
+            return
+        remaining = [e for e in entries if e["id"] != entry_id]
+        if remaining:
+            self.identity_plates[key] = remaining
+        else:
+            self.identity_plates.pop(key, None)
 
     async def _require_identity(self, db: AsyncSession, identity_id: int) -> None:
         identity = await IdentityRepository.get(db, identity_id)
@@ -125,7 +152,9 @@ class IdentityPlateService:
             )
         entry = await IdentityPlateRepository.create(db, identity_id, normalized)
         with self._cache_lock:
-            self.identity_plates[_normalize(entry.plate_number)] = _to_dict(entry)
+            self.identity_plates.setdefault(
+                _normalize(entry.plate_number), [],
+            ).append(_to_dict(entry))
         return entry
 
     async def get(self, db: AsyncSession, entry_id: int) -> IdentityPlate:
@@ -156,14 +185,14 @@ class IdentityPlateService:
                     detail=f"Plate {normalized} already assigned to this identity",
                 )
         old_key = _normalize(entry.plate_number)
+        entry_id = entry.id
         entry = await IdentityPlateRepository.update(db, entry, normalized)
         new_key = _normalize(entry.plate_number)
         with self._cache_lock:
-            # Drop the old key first in case the plate number changed, otherwise
-            # the rename would leave a stale duplicate in the cache.
-            if old_key != new_key:
-                self.identity_plates.pop(old_key, None)
-            self.identity_plates[new_key] = _to_dict(entry)
+            # Drop this entry from its old bucket first in case the plate number
+            # changed, otherwise the rename would leave a stale duplicate.
+            self._cache_remove(old_key, entry_id)
+            self.identity_plates.setdefault(new_key, []).append(_to_dict(entry))
         return entry
 
     async def delete(self, db: AsyncSession, entry_id: int) -> None:
@@ -172,7 +201,7 @@ class IdentityPlateService:
         key = _normalize(entry.plate_number)
         await IdentityPlateRepository.delete(db, entry)
         with self._cache_lock:
-            self.identity_plates.pop(key, None)
+            self._cache_remove(key, entry_id)
 
 
 identity_plate_service = IdentityPlateService()
