@@ -52,7 +52,9 @@ class MemoryResponse(BaseModel):
 
 
 class DiskResponse(BaseModel):
-    # Live-only (read at request/broadcast time) — no DB row, so no id.
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
     ts: int
     total_bytes: int
     used_bytes: int
@@ -93,6 +95,12 @@ class RgaResponse(BaseModel):
     core2: Optional[float] = None
 
 
+class UptimeResponse(BaseModel):
+    # Live-only (read at request/broadcast time) — not persisted.
+    uptime_seconds: int   # số giây hệ thống đã chạy kể từ lúc boot
+    boot_time: int        # epoch giây thời điểm boot
+
+
 class SystemMetricsCurrent(BaseModel):
     """The latest single sample of each series (None if not collected yet)."""
 
@@ -100,6 +108,7 @@ class SystemMetricsCurrent(BaseModel):
     cpu_temperature: Optional[CpuTemperatureResponse] = None
     memory: Optional[MemoryResponse] = None
     disk: Optional[DiskResponse] = None
+    uptime: Optional[UptimeResponse] = None
     load_avg: Optional[LoadAvgResponse] = None
     npu: Optional[NpuResponse] = None
     rga: Optional[RgaResponse] = None
@@ -111,6 +120,7 @@ class SystemMetricsHistory(BaseModel):
     cpu_usage: List[CpuUsageResponse]
     cpu_temperature: List[CpuTemperatureResponse]
     memory: List[MemoryResponse]
+    disk: List[DiskResponse]
     load_avg: List[LoadAvgResponse]
     npu: List[NpuResponse]
     rga: List[RgaResponse]

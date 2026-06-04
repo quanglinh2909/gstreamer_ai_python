@@ -63,6 +63,21 @@ class MemoryMetric(Base):
     __table_args__ = (Index("ix_metric_memory_ts", "ts"),)
 
 
+class DiskMetric(Base):
+    """Root filesystem (/) usage snapshot (bytes + percent)."""
+
+    __tablename__ = "metric_disk"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ts: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    used_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    free_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    percent: Mapped[float] = mapped_column(nullable=False)
+
+    __table_args__ = (Index("ix_metric_disk_ts", "ts"),)
+
+
 class LoadAvgMetric(Base):
     """1/5/15-minute load averages, with the core count for normalisation."""
 

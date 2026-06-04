@@ -16,10 +16,8 @@ class SystemMetricsService:
     ) -> dict:
         """Both the current snapshot and the recent history of every series."""
         current = await SystemMetricsRepository.fetch_latest(db)
-        # Disk is live-only (no history table) — read it fresh for `current`.
-        disk = reader.read_disk()
-        disk["ts"] = reader.now_ts()
-        current["disk"] = disk
+        # Uptime is live-only (no history table) — read it fresh for `current`.
+        current["uptime"] = reader.read_uptime()
         history = await SystemMetricsRepository.fetch_all(db, limit, from_ts, to_ts)
         return {"current": current, "history": history}
 

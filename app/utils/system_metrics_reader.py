@@ -105,6 +105,20 @@ def read_disk(path: str = "/") -> dict:
         return {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0, "percent": 0.0}
 
 
+def read_uptime() -> dict:
+    """System uptime since boot (seconds) plus the boot epoch.
+
+    Live-only — not persisted; surfaced in the API `current` snapshot and the
+    WebSocket feed so a UI can show "đã chạy bao lâu".
+    """
+    try:
+        boot = psutil.boot_time()
+        return {"uptime_seconds": int(time.time() - boot), "boot_time": int(boot)}
+    except Exception as e:
+        print(f"[metrics] uptime read error: {e}")
+        return {"uptime_seconds": 0, "boot_time": 0}
+
+
 def read_load_avg() -> dict:
     try:
         l1, l5, l15 = os.getloadavg()
@@ -198,6 +212,7 @@ def collect_all() -> dict:
         "cpu_temperature": read_cpu_temperature(),
         "memory": read_memory(),
         "disk": read_disk(),
+        "uptime": read_uptime(),
         "load_avg": read_load_avg(),
         "npu": read_npu(),
         "rga": read_rga(),

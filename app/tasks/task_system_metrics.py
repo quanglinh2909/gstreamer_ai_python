@@ -85,10 +85,9 @@ class TaskSystemMetrics:
         system_metrics_broadcaster.publish({"type": "system_metrics", **m})
 
         async with self._session_factory() as db:
-            # disk is broadcast over WS but not persisted (live-only).
             await SystemMetricsRepository.insert_sample(
                 db, m["ts"], m["cpu_usage"], m["cpu_temperature"],
-                m["memory"], m["load_avg"], m["npu"], m["rga"],
+                m["memory"], m["disk"], m["load_avg"], m["npu"], m["rga"],
             )
 
     async def _purge_old(self):

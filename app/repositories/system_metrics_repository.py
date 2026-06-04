@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.system_metrics import (
     CpuTemperatureMetric,
     CpuUsageMetric,
+    DiskMetric,
     LoadAvgMetric,
     MemoryMetric,
     NpuMetric,
@@ -17,11 +18,11 @@ from app.models.system_metrics import (
 
 # series key -> ORM model. The query/cleanup paths iterate this so adding a
 # series only means adding a model here (and a reader call in the collector).
-# NB: disk is intentionally NOT here — it's live-only (current + WS), no history.
 METRIC_MODELS = {
     "cpu_usage": CpuUsageMetric,
     "cpu_temperature": CpuTemperatureMetric,
     "memory": MemoryMetric,
+    "disk": DiskMetric,
     "load_avg": LoadAvgMetric,
     "npu": NpuMetric,
     "rga": RgaMetric,
@@ -36,14 +37,12 @@ class SystemMetricsRepository:
         cpu_usage: dict,
         cpu_temperature: dict,
         memory: dict,
+        disk: dict,
         load_avg: dict,
         npu: dict,
         rga: dict,
     ) -> None:
-        """Write one row into each of the six persisted tables for a cycle.
-
-        Disk is deliberately excluded — it's served live only (current + WS).
-        """
+        """Write one row into each of the seven tables for a single cycle."""
         db.add(CpuUsageMetric(
             ts=ts,
             usage_percent=cpu_usage["usage_percent"],
@@ -54,6 +53,7 @@ class SystemMetricsRepository:
         ))
         db.add(CpuTemperatureMetric(ts=ts, **cpu_temperature))
         db.add(MemoryMetric(ts=ts, **memory))
+        db.add(DiskMetric(ts=ts, **disk))
         db.add(LoadAvgMetric(ts=ts, **load_avg))
         db.add(NpuMetric(ts=ts, **npu))
         db.add(RgaMetric(ts=ts, **rga))

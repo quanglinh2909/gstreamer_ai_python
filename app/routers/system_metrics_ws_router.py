@@ -21,6 +21,7 @@ async def system_metrics_ws(ws: WebSocket):
                 "available_bytes": int, "percent": float},
      "disk": {"total_bytes": int, "used_bytes": int,
               "free_bytes": int, "percent": float},
+     "uptime": {"uptime_seconds": int, "boot_time": int},
      "load_avg": {"load1": float, "load5": float, "load15": float,
                   "cpu_count": int},
      "npu": {"load_percent": float|null, "core0": ..., "core1": ..., "core2": ...},
