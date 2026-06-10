@@ -10,17 +10,16 @@ wrap calls in `asyncio.to_thread` to avoid blocking the event loop.
 """
 from __future__ import annotations
 
-import importlib.util
 import sys
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from app.core.config import settings
+from app.utils.align_face import align_face as _align_face_fn
 
 
 @dataclass
@@ -33,21 +32,6 @@ class FaceExtractResult:
 _lock = threading.Lock()
 _detector = None
 _rknn = None
-_align_face_fn = None
-
-
-def _load_align_face_function(path: str):
-    module_path = Path(path)
-    if not module_path.exists():
-        raise FileNotFoundError(f"align_face.py not found: {module_path}")
-    spec = importlib.util.spec_from_file_location("adaface_align_face", module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to import align_face module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if not hasattr(module, "align_face"):
-        raise RuntimeError(f"align_face function not found in {module_path}")
-    return module.align_face
 
 
 def _load_yolo(path: str):
@@ -79,16 +63,14 @@ def _load_rknn(path: str):
 
 
 def _ensure_loaded() -> None:
-    global _detector, _rknn, _align_face_fn
-    if _detector is not None and _rknn is not None and _align_face_fn is not None:
+    global _detector, _rknn
+    if _detector is not None and _rknn is not None:
         return
     with _lock:
         if _detector is None:
             _detector = _load_yolo(settings.FACE_DETECTOR_MODEL_PATH)
             print(f"[face_embedder] loaded detector: {settings.FACE_DETECTOR_MODEL_PATH}",
                   file=sys.stderr)
-        if _align_face_fn is None:
-            _align_face_fn = _load_align_face_function(settings.FACE_ALIGN_MODULE_PATH)
         if _rknn is None:
             _rknn = _load_rknn(settings.FACE_EMBEDDING_MODEL_PATH)
             print(f"[face_embedder] loaded AdaFace: {settings.FACE_EMBEDDING_MODEL_PATH}",

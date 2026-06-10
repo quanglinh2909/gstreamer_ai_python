@@ -21,8 +21,6 @@ class Settings(BaseSettings):
         "/home/orangepi/face_inspireface/weight/yolov8n-face_rknn_model_640"
     FACE_EMBEDDING_MODEL_PATH: Optional[str] = \
         "/home/orangepi/Documents/test/weights/adaface_ir101_fp16.rknn"
-    FACE_ALIGN_MODULE_PATH: Optional[str] = \
-        "/home/orangepi/Documents/AdaFace/align_face.py"
     FACE_DETECT_CONF: Optional[float] = 0.5
 
     class Config:
