@@ -20,25 +20,25 @@ from app.utils.plate_recognition_hepper import detect_plate_from_children
 from app.services.plate_white_list_service import plate_white_list_service
 from app.ws.plate_event_ws import plate_event_broadcaster
 
-# PLATE_SPEC = AIJobSpec(
-#     config_type=TypeConfigAiEnum.PLATE_RECOGNITION.value,
-#     transform_data="align_plate",
-#     name="plate recognition",
-#     model_file_1="plate_number_seg.rknn",
-#     model_file_2="ocr.rknn",
-#     model_type_1="yolov8_seg",
-#     model_type_2="yolov8_detect",
-# )
-
 PLATE_SPEC = AIJobSpec(
     config_type=TypeConfigAiEnum.PLATE_RECOGNITION.value,
     transform_data="align_plate",
     name="plate recognition",
     model_file_1="plate_number_seg.rknn",
-    model_file_2="rf_detf_ocr.rknn",
+    model_file_2="ocr.rknn",
     model_type_1="yolov8_seg",
-    model_type_2="rf_detect",
+    model_type_2="yolov8_detect",
 )
+
+# PLATE_SPEC = AIJobSpec(
+#     config_type=TypeConfigAiEnum.PLATE_RECOGNITION.value,
+#     transform_data="align_plate",
+#     name="plate recognition",
+#     model_file_1="plate_number_seg.rknn",
+#     model_file_2="rf_detf_ocr.rknn",
+#     model_type_1="yolov8_seg",
+#     model_type_2="rf_detect",
+# )
 
 
 
