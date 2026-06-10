@@ -5,6 +5,8 @@ import time
 import traceback
 from queue import Queue
 
+import httpx
+
 from app.utils.orangepi_gpio import gpio_barrie_orangepi
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -31,6 +33,9 @@ class TaskParkingLot:
         self.task_queue = Queue()
         self.faces = {}
         self.plates = {}
+        # Strong refs to in-flight fire-and-forget BLE notifications so the
+        # event loop doesn't garbage-collect them mid-request.
+        self._bg_tasks = set()
         # Built inside the worker's own event loop (see _run); the queue
         # consumer runs in a dedicated thread so it can't share the global
         # async engine (asyncpg ties connections to the loop that made them).
@@ -100,6 +105,36 @@ class TaskParkingLot:
         except Exception as e:
             print(f"parking lot event persist error: {e}")
 
+    async def _notify_ble_detect(self, mac, identity_id, camera_id):
+        # Best-effort call to the Bluetooth service. Failures must not block
+        # barrier logic, so we swallow every error and just log it.
+        if not settings.BLE_DETECT_URL:
+            return
+        payload = {
+            "mac": mac,
+            "identity_id": identity_id,
+            "camera_id": str(camera_id) if camera_id is not None else "",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                # Skip /detect if the service is already scanning this MAC.
+                scan_resp = await client.get(
+                    settings.BLE_DETECT_URL + "/is-scanning",
+                    params={"mac": mac},
+                )
+                scan_resp.raise_for_status()
+                if scan_resp.json().get("scanning"):
+                    print(f"BLE already scanning {mac}, skip /detect")
+                    return
+
+                response = await client.post(
+                    settings.BLE_DETECT_URL + "/detect", json=payload,
+                )
+                response.raise_for_status()
+                print(f"BLE detect notified: {payload} -> {response.status_code}")
+        except Exception as e:
+            print(f"BLE detect notify failed for {payload}: {e}")
+
     def worker(self):
         # Thread entrypoint: run the async consumer on its own event loop.
         try:
@@ -149,8 +184,16 @@ class TaskParkingLot:
             key = f"{identity_id}_{camera_id}"
             _camera_plate = parking_lot_service.get_plate_camera(camera_id)
 
-            if key in self.faces or not _camera_plate:
-                print(f"Face {identity_id} from camera {camera_id} already processed or no plate camera linked")
+            if not _camera_plate:
+                return
+
+            if key in self.faces:
+                # Sliding window: a continuously-detected face keeps its entry
+                # alive (and its snapshot fresh) instead of expiring 20s after
+                # the FIRST sighting. The partner plate branch handles the
+                # actual correlation when the plate arrives.
+                self.faces[key]["timestamp"] = timestamp
+                self.faces[key]["full_jpeg"] = full_jpeg
                 return
 
             lot = parking_lot_service.get_by_camera_id(camera_id)
@@ -189,9 +232,27 @@ class TaskParkingLot:
             # get_by_identity_id.
             plate_number = _candidates[0]["plate_number"]
             key = f"{plate_number}_{camera_id}"
+
             if key in self.plates:
-                print(f"Plate {plate_number} from camera {camera_id} already processed")
+                # Sliding window: refresh instead of expiring 20s after the
+                # first read. Skip the duplicate work (BLE + barrier) below.
+                self.plates[key]["timestamp"] = timestamp
+                self.plates[key]["full_jpeg"] = full_jpeg
                 return
+
+            # Notify the BLE service for every co-owner of the plate, but
+            # fire-and-forget: a slow/blocking call here would stall the single
+            # worker loop and could push later events past the 20s window.
+            for _data in _candidates:
+                _mac = _data.get("mac_bluetooth")
+                if _mac and settings.BLE_DETECT_URL:
+                    bg = asyncio.create_task(
+                        self._notify_ble_detect(
+                            _mac, _data["identity_id"], _camera_face,
+                        )
+                    )
+                    self._bg_tasks.add(bg)
+                    bg.add_done_callback(self._bg_tasks.discard)
 
             lot = parking_lot_service.get_by_camera_id(camera_id)
             # Open the barrier for whichever co-owner of the plate has a recent
@@ -200,6 +261,11 @@ class TaskParkingLot:
                 _identity_id = _data["identity_id"]
                 _face_key = f"{_identity_id}_{_camera_face}"
                 if _face_key in self.faces:
+                    print(
+                        f"[parking_lot] match identity={_identity_id} "
+                        f"plate={plate_number} "
+                        f"mac_bluetooth={_data.get('mac_bluetooth')}"
+                    )
                     await self.valid_success(
                         lot, _identity_id, plate_number,
                         self.faces[_face_key].get("full_jpeg"), full_jpeg,

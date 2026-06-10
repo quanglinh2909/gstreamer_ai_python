@@ -8,16 +8,26 @@ from app.models.identity import Identity
 
 class IdentityRepository:
     @staticmethod
-    async def create(db: AsyncSession, name: str) -> Identity:
-        identity = Identity(name=name)
+    async def create(
+        db: AsyncSession, name: str, mac_bluetooth: Optional[str] = None
+    ) -> Identity:
+        identity = Identity(name=name, mac_bluetooth=mac_bluetooth)
         db.add(identity)
         await db.commit()
         await db.refresh(identity)
         return identity
 
     @staticmethod
-    async def update(db: AsyncSession, identity: Identity, name: str) -> Identity:
-        identity.name = name
+    async def update(
+        db: AsyncSession,
+        identity: Identity,
+        name: Optional[str] = None,
+        mac_bluetooth: Optional[str] = None,
+    ) -> Identity:
+        if name is not None:
+            identity.name = name
+        if mac_bluetooth is not None:
+            identity.mac_bluetooth = mac_bluetooth
         await db.commit()
         await db.refresh(identity)
         return identity

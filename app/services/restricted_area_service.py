@@ -49,6 +49,15 @@ UPLOADS_ROOT = os.path.join(
 
 
 class RestrictedAreaService:
+    # (camera_id, tracker_id) -> timestamp of the last event written for that
+    # tracker. A tracker that exits and re-enters within this window (brief
+    # occlusion, boundary loiter) is treated as the same presence and does not
+    # produce a second row. This is the only dedup for restricted-area events.
+    _REENTER_COOLDOWN_S = 15
+
+    def __init__(self):
+        self._last_saved: dict = {}
+
     async def restricted_area(self, db: AsyncSession, req: RestrictedAreaDTO):
         return await ai_job_service.upsert(db, req, RESTRICTED_AREA_SPEC)
 
@@ -186,6 +195,13 @@ class RestrictedAreaService:
         parent = self._find_parent(meta, id)
         if parent is None:
             return
+        key = (str(meta["cameraId"]), int(id))
+        last = self._last_saved.get(key)
+        if last is not None and timestamp - last < self._REENTER_COOLDOWN_S:
+            return
+        # Stamp synchronously (before the async write) so a re-enter on the
+        # very next frame is suppressed even while the row is still being saved.
+        self._last_saved[key] = timestamp
         print(f"restricted_area entered_zone id={id} class={parent.get('classId')}")
         asyncio.create_task(
             self._persist_event(meta, parent, full_jpeg, id, timestamp)
@@ -195,6 +211,10 @@ class RestrictedAreaService:
         print(f"restricted_area dwell_alert id={id}")
 
     def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf):
+        # Keep recent stamps so a quick re-enter is still deduped, but drop
+        # aged-out ones so the map can't grow without bound.
+        cutoff = timestamp - self._REENTER_COOLDOWN_S
+        self._last_saved = {k: t for k, t in self._last_saved.items() if t >= cutoff}
         print(f"restricted_area exited_zone id={id}")
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf):

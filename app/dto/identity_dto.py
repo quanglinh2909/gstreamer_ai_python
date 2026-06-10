@@ -8,6 +8,7 @@ class IdentityResponse(BaseModel):
 
     id: int
     name: str
+    mac_bluetooth: Optional[str] = None
     image_full: Optional[str] = None
     image_crop: Optional[str] = None
 
@@ -23,6 +24,7 @@ class FaceInfo(BaseModel):
 class IdentityWithFaceResponse(BaseModel):
     id: int
     name: str
+    mac_bluetooth: Optional[str] = None
     image_full: Optional[str] = None
     image_crop: Optional[str] = None
     face: Optional[FaceInfo] = None

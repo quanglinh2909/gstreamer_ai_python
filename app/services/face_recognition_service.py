@@ -47,10 +47,18 @@ UPLOADS_ROOT = os.path.join(
 
 
 class FaceRecognitionService:
+    # (cameraId, tracker_id) -> timestamp of the last EventFace written for
+    # that tracker. _track_state already prevents duplicate rows while a
+    # tracker stays continuously in the zone; this guards the exit/re-enter
+    # case (brief occlusion) where _track_state is cleared but the tracker
+    # keeps its id, which would otherwise write a second row.
+    _REENTER_COOLDOWN_S = 15
+
     def __init__(self):
         # (cameraId, tracker_id) -> one of _MATCHING / _PENDING / _RESOLVED.
         # Survives across frames of the same tracker; cleared on exited_zone.
         self._track_state: dict = {}
+        self._last_saved: dict = {}
 
     async def face_recognition(self, db: AsyncSession, req: FaceRecognitionDTO):
         return await ai_job_service.upsert(db, req, FACE_SPEC)
@@ -289,7 +297,7 @@ class FaceRecognitionService:
         similarity = 0.0
         embedding = self._extract_embedding(parent)
         if embedding:
-            _identity_id, _similarity = await self._match_identity(embedding, 0.15)
+            _identity_id, _similarity = await self._match_identity(embedding, secondary_conf)
             if _identity_id is not None:
                 task_parking_lot.add_task({
                     "task": "face_recognition",
@@ -313,6 +321,15 @@ class FaceRecognitionService:
         if not identity_id:
             return None
 
+        # Exit/re-enter dedup: the same tracker may briefly leave the zone
+        # (occlusion) which clears _track_state, then re-enter under the same
+        # id. Skip writing another row if we saved one for this tracker very
+        # recently — but still return the match so it stays RESOLVED.
+        key = (str(meta["cameraId"]), int(tid))
+        last = self._last_saved.get(key)
+        if last is not None and timestamp - last < self._REENTER_COOLDOWN_S:
+            return identity_id
+
         try:
             paths = await asyncio.to_thread(
                 self._save_images_blocking, full_jpeg, meta, parent, tid,
@@ -332,6 +349,7 @@ class FaceRecognitionService:
                 )
                 db.add(event)
                 await db.commit()
+                self._last_saved[key] = timestamp
 
                 # Resolve the identity name in the same session so the
                 # broadcast carries everything a UI needs (id + label),
@@ -418,6 +436,10 @@ class FaceRecognitionService:
 
     def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf):
         self._track_state.pop((str(meta["cameraId"]), int(id)), None)
+        # Keep recent save stamps for the re-enter cooldown; drop aged-out
+        # ones so the map can't grow without bound.
+        cutoff = timestamp - self._REENTER_COOLDOWN_S
+        self._last_saved = {k: t for k, t in self._last_saved.items() if t >= cutoff}
         print(f"Face exited_zone")
 
 

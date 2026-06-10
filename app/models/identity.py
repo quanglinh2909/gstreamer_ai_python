@@ -11,5 +11,6 @@ class Identity(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    mac_bluetooth: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     image_full: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     image_crop: Mapped[Optional[str]] = mapped_column(String, nullable=True)

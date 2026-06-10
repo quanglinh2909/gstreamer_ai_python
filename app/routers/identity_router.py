@@ -17,12 +17,14 @@ tags = ["Identity"]
 @router.post("", response_model=IdentityWithFaceResponse)
 async def create_identity(
     name: str = Form(...),
+    mac_bluetooth: Optional[str] = Form(None),
     image: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
     return await identity_service.create_with_face(
         db=db,
         name=name,
+        mac_bluetooth=mac_bluetooth,
         image=(image.filename, await image.read(), image.content_type),
     )
 
@@ -31,6 +33,7 @@ async def create_identity(
 async def update_identity(
     identity_id: int,
     name: Optional[str] = Form(None),
+    mac_bluetooth: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -41,6 +44,7 @@ async def update_identity(
         db=db,
         identity_id=identity_id,
         name=name,
+        mac_bluetooth=mac_bluetooth,
         image=image_tuple,
     )
 

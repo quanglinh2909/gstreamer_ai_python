@@ -14,9 +14,13 @@ from app.services.face_recognition_service import UPLOADS_ROOT, face_recognition
 
 class IdentityService:
     async def create_with_face(
-        self, db: AsyncSession, name: str, image: tuple
+        self,
+        db: AsyncSession,
+        name: str,
+        image: tuple,
+        mac_bluetooth: Optional[str] = None,
     ) -> IdentityWithFaceResponse:
-        identity = await IdentityRepository.create(db, name)
+        identity = await IdentityRepository.create(db, name, mac_bluetooth)
         try:
             face = await face_recognition_service.register_face(identity.id, image)
         except Exception:
@@ -30,6 +34,7 @@ class IdentityService:
         return IdentityWithFaceResponse(
             id=identity.id,
             name=identity.name,
+            mac_bluetooth=identity.mac_bluetooth,
             image_full=identity.image_full,
             image_crop=identity.image_crop,
             face=face,
@@ -41,13 +46,16 @@ class IdentityService:
         identity_id: int,
         name: Optional[str],
         image: Optional[tuple],
+        mac_bluetooth: Optional[str] = None,
     ) -> IdentityWithFaceResponse:
         identity = await IdentityRepository.get(db, identity_id)
         if identity is None:
             raise HTTPException(status_code=404, detail="Identity not found")
 
-        if name is not None:
-            identity = await IdentityRepository.update(db, identity, name)
+        if name is not None or mac_bluetooth is not None:
+            identity = await IdentityRepository.update(
+                db, identity, name, mac_bluetooth
+            )
 
         face = None
         if image is not None:
@@ -61,6 +69,7 @@ class IdentityService:
         return IdentityWithFaceResponse(
             id=identity.id,
             name=identity.name,
+            mac_bluetooth=identity.mac_bluetooth,
             image_full=identity.image_full,
             image_crop=identity.image_crop,
             face=face,

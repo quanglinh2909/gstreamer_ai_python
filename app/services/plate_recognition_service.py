@@ -66,10 +66,19 @@ UPLOADS_ROOT = os.path.join(
 
 
 class PlateRecognitionService:
+    # (camera_id, tracker_id) -> timestamp of the last EventPlate written for
+    # that tracker. _track_state stops duplicates while a car stays in the
+    # zone; this guards the exit/re-enter case (the car briefly leaves the
+    # zone or detection drops) where _track_state is cleared but the tracker
+    # keeps its id, which would otherwise write a second row. Longer than the
+    # face window because a parked car can linger at the boundary.
+    _REENTER_COOLDOWN_S = 30
+
     def __init__(self):
         # (camera_id, tracker_id) -> _PENDING / _RESOLVED. Lives across
         # frames of the same tracker; popped on exited_zone.
         self._track_state: dict = {}
+        self._last_saved: dict = {}
 
     @staticmethod
     def _clean_plate(text_plate: str) -> str:
@@ -255,9 +264,18 @@ class PlateRecognitionService:
         # firing the whitelist above, but don't write a duplicate EventPlate.
         if not persist:
             return True
+        # Exit/re-enter dedup: the same tracker may briefly leave the zone
+        # (or detection drops) which clears _track_state, then re-enter under
+        # the same id. Skip the duplicate row but mark RESOLVED so in_the_area
+        # stops retrying.
+        last = self._last_saved.get(key)
+        if last is not None and timestamp - last < self._REENTER_COOLDOWN_S:
+            self._track_state[key] = _RESOLVED
+            return True
         # Confirmed — flip state synchronously before launching the async
         # save so the very next frame's in_the_area sees _RESOLVED and
         # doesn't schedule a duplicate persist.
+        self._last_saved[key] = timestamp
         self._track_state[key] = _RESOLVED
         print(f"{log_label} id={key[1]} plate={text_plate}")
         asyncio.create_task(
@@ -284,6 +302,10 @@ class PlateRecognitionService:
 
     def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf):
         self._track_state.pop((str(meta["cameraId"]), int(id)), None)
+        # Keep recent save stamps for the re-enter cooldown; drop aged-out
+        # ones so the map can't grow without bound.
+        cutoff = timestamp - self._REENTER_COOLDOWN_S
+        self._last_saved = {k: t for k, t in self._last_saved.items() if t >= cutoff}
         print(f"Plate exited_zone")
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf):

@@ -16,6 +16,18 @@ from app.services.restricted_area_service import restricted_area_service
 
 class ProcessAiHepper:
     @staticmethod
+    def lost_buffer_frames(tracker_type="ocsort", fps=15):
+        """How many frames a tracker keeps a lost track alive (and thus the
+        same tracker_id) before dropping it. The zone-exit grace in
+        process_ai_service is sized off this so the zone never declares an
+        object "exited" while the tracker still holds its id — otherwise a
+        brief occlusion clears the per-tracker dedup state and the object
+        re-enters under the *same* id, producing a duplicate event."""
+        if tracker_type in ("botsort", "bytetrack"):
+            return max(10, int(fps * 2))
+        return max(15, int(fps * 3))  # ocsort default (~3s)
+
+    @staticmethod
     def init_tracker(tracker_type="ocsort", threshold=0.25, fps=15):
         # "ocsort" (default, best for low fps) | "bytetrack" | "botsort"
         # high_conf_det_threshold must be <= threshold, otherwise no detection
@@ -26,7 +38,7 @@ class ProcessAiHepper:
         # zombie tracks linger and steal IDs) and at fps=30 only 1s (too
         # short, a one-frame detector miss kills the track). Target ~2s so
         # a brief drop in detection still resumes onto the same tracker_id.
-        buffer = max(10, int(fps * 2))
+        buffer = ProcessAiHepper.lost_buffer_frames(tracker_type, fps)
 
         if tracker_type == "botsort":
             return BoTSORTTracker(
@@ -63,7 +75,7 @@ class ProcessAiHepper:
         #  - minimum_iou_threshold 0.2: looser than the 0.3 default for the
         #    large per-frame displacement at low fps.
         return OCSORTTracker(
-            lost_track_buffer=max(15, int(fps * 3)),
+            lost_track_buffer=buffer,
             frame_rate=fps,
             minimum_consecutive_frames=1,
             minimum_iou_threshold=0.2,

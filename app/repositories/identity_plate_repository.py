@@ -3,6 +3,7 @@ from typing import List, Optional
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.identity import Identity
 from app.models.identity_plate import IdentityPlate
 
 
@@ -68,8 +69,14 @@ class IdentityPlateRepository:
         await db.commit()
 
     @staticmethod
-    async def list_all(db: AsyncSession) -> List[IdentityPlate]:
+    async def list_all(db: AsyncSession) -> List[tuple]:
         """Used at startup to prime the in-memory cache so the AI pipeline can
-        map a detected plate to its identity without hitting the DB."""
-        result = await db.execute(select(IdentityPlate))
-        return result.scalars().all()
+        map a detected plate to its identity without hitting the DB. Joins
+        Identity so the cache can also carry mac_bluetooth. Returns
+        (IdentityPlate, mac_bluetooth) rows."""
+        result = await db.execute(
+            select(IdentityPlate, Identity.mac_bluetooth).join(
+                Identity, Identity.id == IdentityPlate.identity_id
+            )
+        )
+        return result.all()

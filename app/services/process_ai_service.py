@@ -219,6 +219,15 @@ class ProcessAiService:
                     threshold=ai_config.primary_conf,
                     fps=ai_config.fps,
                 )
+                # Zone-exit grace must match how long the tracker keeps a
+                # lost track's id alive. If it's shorter, a brief occlusion
+                # makes the zone fire exited_zone (clearing the per-tracker
+                # dedup state) while the tracker still holds the id — so the
+                # object re-enters under the same id and a duplicate event is
+                # written. Sizing the grace to the lost buffer closes that.
+                exit_grace = ProcessAiHepper.lost_buffer_frames(
+                    ai_config.tracker, ai_config.fps,
+                )
                 self.process_ai.setdefault(camera_id, {})[job_id] = {
                     "tracker": tracker,
                     "polygons": polygons,
@@ -227,6 +236,7 @@ class ProcessAiService:
                     "entered_at": entered_at,
                     "dwell_alerted": dwell_alerted,
                     "fps": ai_config.fps,
+                    "exit_grace": exit_grace,
                     "overlap_threshold": ai_config.overlap_threshold,
                     "dwell_seconds": ai_config.dwell_seconds or 0,
                     "service_ai": ProcessAiHepper.get_service_ai(ai_config.type),
@@ -243,6 +253,7 @@ class ProcessAiService:
                 entered_at = state["entered_at"]
                 dwell_alerted = state["dwell_alerted"]
                 fps = state["fps"]
+                exit_grace = state.get("exit_grace", fps)
                 overlap_threshold = state["overlap_threshold"]
                 dwell_seconds = state["dwell_seconds"]
                 service_ai = state["service_ai"]
@@ -312,7 +323,7 @@ class ProcessAiService:
 
                     for tid in list(ids_in_zone[zone_idx] - current_ids):
                         exit_pending[zone_idx][tid] = exit_pending[zone_idx].get(tid, 0) + 1
-                        if exit_pending[zone_idx][tid] >= fps:
+                        if exit_pending[zone_idx][tid] >= exit_grace:
                             # print(f"ID {tid} EXITED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "exited_zone"):
                                 service_ai.exited_zone(tid, meta, full_jpeg, now, secondary_conf)

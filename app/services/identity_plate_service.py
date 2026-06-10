@@ -1,11 +1,12 @@
 import re
 import threading
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import Levenshtein
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.identity import Identity
 from app.models.identity_plate import IdentityPlate
 from app.repositories.identity_plate_repository import IdentityPlateRepository
 from app.repositories.identity_repository import IdentityRepository
@@ -18,11 +19,12 @@ def _normalize(plate_number: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", plate_number or "").upper()
 
 
-def _to_dict(entry: IdentityPlate) -> Dict:
+def _to_dict(entry: IdentityPlate, mac_bluetooth: Optional[str] = None) -> Dict:
     return {
         "id": entry.id,
         "identity_id": entry.identity_id,
         "plate_number": entry.plate_number,
+        "mac_bluetooth": mac_bluetooth,
     }
 
 
@@ -46,9 +48,9 @@ class IdentityPlateService:
         to wait on I/O."""
         rows = await IdentityPlateRepository.list_all(db)
         grouped: Dict[str, List[Dict]] = {}
-        for row in rows:
-            grouped.setdefault(_normalize(row.plate_number), []).append(
-                _to_dict(row),
+        for entry, mac_bluetooth in rows:
+            grouped.setdefault(_normalize(entry.plate_number), []).append(
+                _to_dict(entry, mac_bluetooth),
             )
         with self._cache_lock:
             self.identity_plates = grouped
@@ -121,10 +123,11 @@ class IdentityPlateService:
         else:
             self.identity_plates.pop(key, None)
 
-    async def _require_identity(self, db: AsyncSession, identity_id: int) -> None:
+    async def _require_identity(self, db: AsyncSession, identity_id: int) -> Identity:
         identity = await IdentityRepository.get(db, identity_id)
         if identity is None:
             raise HTTPException(status_code=404, detail="Identity not found")
+        return identity
 
     async def list_by_identity(
         self, db: AsyncSession, identity_id: int,
@@ -138,7 +141,7 @@ class IdentityPlateService:
         identity_id: int,
         plate_number: str,
     ) -> IdentityPlate:
-        await self._require_identity(db, identity_id)
+        identity = await self._require_identity(db, identity_id)
         normalized = _normalize(plate_number)
         if not normalized:
             raise HTTPException(status_code=400, detail="Plate number is empty")
@@ -154,7 +157,7 @@ class IdentityPlateService:
         with self._cache_lock:
             self.identity_plates.setdefault(
                 _normalize(entry.plate_number), [],
-            ).append(_to_dict(entry))
+            ).append(_to_dict(entry, identity.mac_bluetooth))
         return entry
 
     async def get(self, db: AsyncSession, entry_id: int) -> IdentityPlate:
@@ -186,13 +189,17 @@ class IdentityPlateService:
                 )
         old_key = _normalize(entry.plate_number)
         entry_id = entry.id
+        identity = await IdentityRepository.get(db, entry.identity_id)
+        mac_bluetooth = identity.mac_bluetooth if identity is not None else None
         entry = await IdentityPlateRepository.update(db, entry, normalized)
         new_key = _normalize(entry.plate_number)
         with self._cache_lock:
             # Drop this entry from its old bucket first in case the plate number
             # changed, otherwise the rename would leave a stale duplicate.
             self._cache_remove(old_key, entry_id)
-            self.identity_plates.setdefault(new_key, []).append(_to_dict(entry))
+            self.identity_plates.setdefault(new_key, []).append(
+                _to_dict(entry, mac_bluetooth)
+            )
         return entry
 
     async def delete(self, db: AsyncSession, entry_id: int) -> None:

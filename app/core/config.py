@@ -6,6 +6,9 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     DATABASE_URL: str
     AI_API_BASE_URL: Optional[str] = "http://localhost:8009"
+    # Bluetooth "detect" service: notified with the matched identity's MAC so it
+    # can correlate the BLE beacon with the parking-lot event.
+    BLE_DETECT_URL: Optional[str] = None
     PORT: Optional[int] = 8010
     MILVUS_URI: Optional[str] = "./milvus_face.db"
     MILVUS_FACE_COLLECTION: Optional[str] = "face_embeddings"
