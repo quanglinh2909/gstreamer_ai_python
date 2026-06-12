@@ -67,14 +67,30 @@ def _draw_label(img, text, x, y, bg_color):
 
 
 def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
-                 min_score: float = _DEFAULT_MIN_SCORE) -> bytes:
+                 min_score: float = _DEFAULT_MIN_SCORE,
+                 decode_scale: float = 1.0) -> bytes:
     # Defensive: process_ai_service already filters empty jpegs out, but
     # a race or future code path could still reach us with no bytes.
     # `imdecode` asserts on an empty buffer, which would tear the whole
     # MJPEG stream down — return empty so the router skips this tick.
     if not full_jpeg:
         return b""
-    img = cv2.imdecode(np.frombuffer(full_jpeg, np.uint8), cv2.IMREAD_COLOR)
+
+    # Decode at a reduced resolution when asked. libjpeg can emit 1/2 or 1/4
+    # scale straight out of the IDCT — far cheaper than a full decode + a
+    # separate resize — and the smaller image makes drawing and re-encoding
+    # cheaper too. Detection / zone coordinates are in full-res space, so we
+    # scale them by the SAME factor `s` before drawing.
+    buf = np.frombuffer(full_jpeg, np.uint8)
+    if decode_scale <= 0.25:
+        img = cv2.imdecode(buf, cv2.IMREAD_REDUCED_COLOR_4)
+        s = 0.25
+    elif decode_scale <= 0.5:
+        img = cv2.imdecode(buf, cv2.IMREAD_REDUCED_COLOR_2)
+        s = 0.5
+    else:
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        s = 1.0
     if img is None:
         return b""
 
@@ -83,7 +99,7 @@ def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
         for poly in polygons:
             if poly is None:
                 continue
-            pts = np.asarray(poly, dtype=np.int32)
+            pts = (np.asarray(poly, dtype=np.float32) * s).astype(np.int32)
             cv2.polylines(img, [pts], True, _ZONE_COLOR, 2)
 
     for det in meta.get("detections", []):
@@ -91,15 +107,18 @@ def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
         # detectors don't clutter the debug view (see _DEFAULT_MIN_SCORE).
         if float(det.get("score", 0.0)) < min_score:
             continue
-        x1 = int(det.get("x1", 0))
-        y1 = int(det.get("y1", 0))
-        x2 = int(det.get("x2", 0))
-        y2 = int(det.get("y2", 0))
-        bbox = np.array([x1, y1, x2, y2], dtype=np.float32)
-        # Colour by zone membership — green inside a zone, red outside.
-        # Same rule the recv loop uses for entered/exited events, so the
-        # visual matches what the AI pipeline actually counts.
+        # Zone membership is judged in FULL-RES space (the same space the
+        # recv loop uses), then coordinates are scaled down for drawing.
+        fx1 = float(det.get("x1", 0))
+        fy1 = float(det.get("y1", 0))
+        fx2 = float(det.get("x2", 0))
+        fy2 = float(det.get("y2", 0))
+        bbox = np.array([fx1, fy1, fx2, fy2], dtype=np.float32)
         color = _IN_ZONE_COLOR if _det_in_any_zone(bbox, polygons) else _OUT_ZONE_COLOR
+        x1 = int(fx1 * s)
+        y1 = int(fy1 * s)
+        x2 = int(fx2 * s)
+        y2 = int(fy2 * s)
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
 
         # Compact label: tracker_id (when assigned), class, score, plate.

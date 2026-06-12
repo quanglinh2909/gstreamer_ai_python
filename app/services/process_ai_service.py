@@ -262,7 +262,12 @@ class ProcessAiService:
                 ai_type = state.get("ai_type")
 
                 detections = ProcessAiHepper.to_sv_detections(meta.get("detections", []))
-                detections = ProcessAiHepper.update_tracker(
+                # Off the loop: with BoTSORT this decodes the full JPEG and
+                # runs optical-flow CMC (tens of ms on the RK3588 CPU); run
+                # inline it would starve the fire-and-forget tasks (face
+                # match, persist, websocket pushes) that share this loop.
+                detections = await asyncio.to_thread(
+                    ProcessAiHepper.update_tracker,
                     tracker, detections, full_jpeg, ai_type=ai_type,
                 )
                 if detections.tracker_id is None or len(detections) == 0:

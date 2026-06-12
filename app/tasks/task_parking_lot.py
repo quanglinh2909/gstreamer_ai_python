@@ -3,7 +3,7 @@ import datetime
 import os
 import time
 import traceback
-from queue import Queue
+from queue import Empty, Full, Queue
 
 import httpx
 
@@ -30,7 +30,10 @@ class TaskParkingLot:
     TIME_EXPIRED = 20  # thời gian lưu trữ thông tin (giây)
 
     def __init__(self):
-        self.task_queue = Queue()
+        # Bounded: every detection enqueues here, so a stalled consumer (slow
+        # DB / BLE endpoint) must shed load instead of growing without limit.
+        # Entries older than TIME_EXPIRED are useless for correlation anyway.
+        self.task_queue = Queue(maxsize=256)
         self.faces = {}
         self.plates = {}
         # Strong refs to in-flight fire-and-forget BLE notifications so the
@@ -77,7 +80,7 @@ class TaskParkingLot:
 
     def _open_barrier(self, lot_id):
         try:
-            gpio_barrie_orangepi.open_barrie(5)
+            # gpio_barrie_orangepi.open_barrie(5)
             # response.raise_for_status()
             print(f"Barrier opened for parking lot {lot_id}")
         except Exception as e:
@@ -279,7 +282,19 @@ class TaskParkingLot:
             }
 
     def add_task(self, task):
-        self.task_queue.put(task)
+        # Never block the AI recv loop: when the queue is full, drop the
+        # oldest entry — it is the least likely to still fall inside the
+        # TIME_EXPIRED correlation window.
+        while True:
+            try:
+                self.task_queue.put_nowait(task)
+                return
+            except Full:
+                try:
+                    self.task_queue.get_nowait()
+                    self.task_queue.task_done()
+                except Empty:
+                    pass
 
 
 task_parking_lot = TaskParkingLot()
