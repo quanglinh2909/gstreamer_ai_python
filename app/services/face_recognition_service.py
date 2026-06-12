@@ -297,7 +297,7 @@ class FaceRecognitionService:
         similarity = 0.0
         embedding = self._extract_embedding(parent)
         if embedding:
-            _identity_id, _similarity = await self._match_identity(embedding, secondary_conf)
+            _identity_id, _similarity = await self._match_identity(embedding, 0.15)
             if _identity_id is not None:
                 task_parking_lot.add_task({
                     "task": "face_recognition",
