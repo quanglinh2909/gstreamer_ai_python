@@ -71,9 +71,15 @@ class AIJobService:
         existing = self._find_existing(ai_jobs, spec)
 
         if existing:
+            ai_models = await HTTPXClient.get("/ai-models")
             payload = req.model_dump(exclude_none=True, exclude={"polygons"})
             payload["primaryConf"] = 0.2
             payload["secondaryConf"] = 0.2
+            payload["modelPath"] = self._get_path(ai_models, spec.model_file_1)
+            payload["modelPath2"] = self._get_path(ai_models, spec.model_file_2)
+            payload["modelType"] = spec.model_type_1
+            payload["modelType2"] = spec.model_type_2
+            payload["transformData"] = spec.transform_data
             if spec.class_filter is not None:
                 payload["classFilter"] = spec.class_filter
             data = await HTTPXClient.put(f"/ai-jobs/{existing['id']}", json=payload)

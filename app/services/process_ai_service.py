@@ -86,7 +86,7 @@ class ProcessAiService:
             return dict(hit) if hit else None
 
     def _stash_debug_frame(self, camera_id, job_id, meta, full_jpeg, polygons,
-                           primary_conf=0.3) -> None:
+                           primary_conf=0.3, overlap_threshold=None) -> None:
         """Hot path. Returns immediately when nobody is debugging this
         (cam, job). Stores references only — no copies — because the
         recv loop is done mutating `meta` by the time this is called and
@@ -113,6 +113,9 @@ class ProcessAiService:
                 "seq": meta.get("seq", 0),
                 "polygons": polygons,
                 "primary_conf": primary_conf,
+                # So the overlay's green/red in-zone verdict is drawn with
+                # the same threshold the recv loop judged the frame by.
+                "overlap_threshold": overlap_threshold,
             }
 
     def _drain_invalidations(self) -> None:
@@ -228,6 +231,7 @@ class ProcessAiService:
                 exit_grace = ProcessAiHepper.lost_buffer_frames(
                     ai_config.tracker, ai_config.fps,
                 )
+                service_ai = ProcessAiHepper.get_service_ai(ai_config.type)
                 self.process_ai.setdefault(camera_id, {})[job_id] = {
                     "tracker": tracker,
                     "polygons": polygons,
@@ -239,7 +243,10 @@ class ProcessAiService:
                     "exit_grace": exit_grace,
                     "overlap_threshold": ai_config.overlap_threshold,
                     "dwell_seconds": ai_config.dwell_seconds or 0,
-                    "service_ai": ProcessAiHepper.get_service_ai(ai_config.type),
+                    "service_ai": service_ai,
+                    # Classes this service wants tracked (None = all). Only
+                    # gates the tracker input; meta still carries every class.
+                    "track_class_ids": ProcessAiHepper.get_track_class_ids(service_ai),
                     "secondary_conf": ai_config.secondary_conf,
                     "primary_conf": ai_config.primary_conf,
                     "ai_type": ai_config.type,
@@ -260,8 +267,15 @@ class ProcessAiService:
                 secondary_conf = state["secondary_conf"]
                 primary_conf = state.get("primary_conf", 0.3)
                 ai_type = state.get("ai_type")
+                track_class_ids = state.get("track_class_ids")
 
                 detections = ProcessAiHepper.to_sv_detections(meta.get("detections", []))
+                # Tracker sees only the service's classes; `meta` is left
+                # whole, so the debug overlay and event payloads still show
+                # every class in the frame — just untracked.
+                detections = ProcessAiHepper.filter_track_classes(
+                    detections, track_class_ids,
+                )
                 # Off the loop: with BoTSORT this decodes the full JPEG and
                 # runs optical-flow CMC (tens of ms on the RK3588 CPU); run
                 # inline it would starve the fire-and-forget tasks (face
@@ -275,7 +289,8 @@ class ProcessAiService:
                     # raw frame to any debug subscriber so they can see
                     # the model's pre-tracker output (helps spot tracker
                     # over-filtering). Cheap no-op when nobody's watching.
-                    self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons, primary_conf)
+                    self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons,
+                                            primary_conf, overlap_threshold)
                     continue
                 detections = detections[detections.tracker_id >= 0]
 
@@ -294,7 +309,8 @@ class ProcessAiService:
 
                 # Stash with tracker_ids tagged onto raw_dets, so the
                 # MJPEG overlay can show them.
-                self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons, primary_conf)
+                self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons,
+                                        primary_conf, overlap_threshold)
 
                 now = time.time()
                 for zone_idx, polygon in enumerate(polygons):
@@ -302,7 +318,8 @@ class ProcessAiService:
                         in_zone_mask = np.ones(len(detections.xyxy), dtype=bool)
                     else:
                         in_zone_mask = np.array(
-                            [ProcessAiHepper.bbox_in_zone(bbox, polygon)
+                            [ProcessAiHepper.bbox_in_zone(
+                                bbox, polygon, overlap_threshold)
                              for bbox in detections.xyxy],
                             dtype=bool,
                         )

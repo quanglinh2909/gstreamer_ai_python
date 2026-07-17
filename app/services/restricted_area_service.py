@@ -35,12 +35,23 @@ RESTRICTED_AREA_SPEC = AIJobSpec(
     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
     transform_data=None,
     name="restricted area",
-    model_file_1="rf_detr_m.rknn",
+    model_file_1="yolov8-mask-s.rknn",
     model_file_2=None,
-    model_type_1="rf_detect",
+    model_type_1="yolov8_detect",
     model_type_2=None,
-    class_filter="1",
+    class_filter="0,3,5"
 )
+
+# RESTRICTED_AREA_SPEC = AIJobSpec(
+#     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
+#     transform_data=None,
+#     name="restricted area",
+#     model_file_1="rf_detr_m.rknn",
+#     model_file_2=None,
+#     model_type_1="rf_detect",
+#     model_type_2=None,
+#     class_filter="1",
+# )
 
 UPLOADS_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -49,6 +60,16 @@ UPLOADS_ROOT = os.path.join(
 
 
 class RestrictedAreaService:
+    # YOLO class ids to run tracking / zone logic on. Read by
+    # process_ai_service via ProcessAiHepper.get_track_class_ids.
+    #
+    # Only class 0 (person) produces restricted-area events, but unlike
+    # AIJobSpec.class_filter (which drops classes in the C++ engine, before
+    # the message is built) this filters Python-side at the tracker input —
+    # so meta["detections"] still lists every class the model saw and the
+    # debug MJPEG overlay keeps showing them. Set to None to track all.
+    TRACK_CLASS_IDS = frozenset({0})
+
     # (camera_id, tracker_id) -> timestamp of the last event written for that
     # tracker. A tracker that exits and re-enters within this window (brief
     # occlusion, boundary loiter) is treated as the same presence and does not
@@ -220,6 +241,7 @@ class RestrictedAreaService:
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf):
         # No re-persist while the tracker stays — entered_zone already
         # captured a row. dwell_alert handles "stayed too long".
+        # print(meta)
         pass
 
 

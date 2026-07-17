@@ -32,9 +32,12 @@ _FONT_THICKNESS = 3
 _DEFAULT_MIN_SCORE = 0.3
 
 
-def _det_in_any_zone(bbox, polygons) -> bool:
+def _det_in_any_zone(bbox, polygons, overlap_threshold=None) -> bool:
     """True when the detection counts as 'in zone' by the same rule the
-    recv loop uses (bottom-centre `pointPolygonTest` per polygon).
+    recv loop uses (>= overlap_threshold of the bbox area inside the
+    polygon). The threshold must be threaded through from the job's own
+    config — defaulting it here would paint boxes green/red by a
+    different rule than the one that actually fires the events.
     A None polygon is the sentinel for "full-frame virtual zone" so any
     bbox is considered inside it."""
     if not polygons:
@@ -42,7 +45,7 @@ def _det_in_any_zone(bbox, polygons) -> bool:
     for poly in polygons:
         if poly is None:
             return True
-        if ProcessAiHepper.bbox_in_zone(bbox, poly):
+        if ProcessAiHepper.bbox_in_zone(bbox, poly, overlap_threshold):
             return True
     return False
 
@@ -68,7 +71,8 @@ def _draw_label(img, text, x, y, bg_color):
 
 def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
                  min_score: float = _DEFAULT_MIN_SCORE,
-                 decode_scale: float = 1.0) -> bytes:
+                 decode_scale: float = 1.0,
+                 overlap_threshold: float | None = None) -> bytes:
     # Defensive: process_ai_service already filters empty jpegs out, but
     # a race or future code path could still reach us with no bytes.
     # `imdecode` asserts on an empty buffer, which would tear the whole
@@ -114,7 +118,9 @@ def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
         fx2 = float(det.get("x2", 0))
         fy2 = float(det.get("y2", 0))
         bbox = np.array([fx1, fy1, fx2, fy2], dtype=np.float32)
-        color = _IN_ZONE_COLOR if _det_in_any_zone(bbox, polygons) else _OUT_ZONE_COLOR
+        color = (_IN_ZONE_COLOR
+                 if _det_in_any_zone(bbox, polygons, overlap_threshold)
+                 else _OUT_ZONE_COLOR)
         x1 = int(fx1 * s)
         y1 = int(fy1 * s)
         x2 = int(fx2 * s)

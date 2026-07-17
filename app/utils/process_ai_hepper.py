@@ -83,8 +83,20 @@ class ProcessAiHepper:
             high_conf_det_threshold=high_conf,
         )
 
+    # Fraction of a bbox that must fall inside a zone before it counts as
+    # "in". Mirrors the DTO / frontend default (UI shows 30, sent as 0.30)
+    # and is the fallback when ai_config.overlap_threshold is NULL — the
+    # column is nullable, so rows predating the setting still work.
+    DEFAULT_OVERLAP_THRESHOLD = 0.30
+
     @staticmethod
     def bbox_zone_overlap(bbox, polygon):
+        """Fraction of the bbox's area that lies inside the polygon, 0..1.
+
+        Rasterises the polygon into a bbox-sized mask and counts covered
+        pixels, so concave / multi-vertex zones are handled exactly.
+        cv2.fillPoly clips to the mask, which is what bounds the count to
+        the intersection."""
         x1, y1, x2, y2 = bbox.astype(int)
         w, h = x2 - x1, y2 - y1
         if w <= 0 or h <= 0:
@@ -95,29 +107,30 @@ class ProcessAiHepper:
         return float(np.count_nonzero(mask)) / (w * h)
 
     @staticmethod
-    def bbox_in_zone(bbox, polygon) -> bool:
-        """Industry-standard zone membership: a single point at the bbox
-        bottom-centre is tested against the polygon.
+    def bbox_in_zone(bbox, polygon, overlap_threshold=None) -> bool:
+        """Zone membership by area coverage: the detection is "in" once at
+        least `overlap_threshold` of its bbox area falls inside the polygon.
 
-        Bottom-centre `(cx, y2)` is what Frigate, NVIDIA DeepStream,
-        Axis analytics and `supervision.PolygonZone` (with the default
-        Position.BOTTOM_CENTER) all use. It maps the detection to a
-        single 2D anchor — the point where the object visually meets
-        the ground / reference plane in image space — which avoids the
-        2D-to-3D ambiguity of area-overlap or vertical-axis projection
-        (those count an object as "in zone" whenever its image-space
-        column crosses the polygon, even when it is actually behind the
-        zone in 3D).
+        This is what the overlap_threshold knob on the UI drives — 0.30
+        means "counts as inside once 30% of the object is in the zone".
+        A threshold of 0 (or less) means any contact at all counts; without
+        that special case `overlap >= 0` would be true for every detection
+        in the frame, including ones nowhere near the zone.
 
-        Implication for zone authoring: draw the polygon where the
-        bbox's bottom edge will appear — head height for a face
-        detector, floor for a person/body detector, plate-bottom for an
-        ALPR detector. That is the convention these systems all share."""
+        Note the tradeoff vs. the bottom-centre anchor test this replaced
+        (the Frigate / DeepStream / supervision default): area coverage is
+        judged purely in image space, so an object standing *behind* the
+        zone but whose bbox column crosses it can register as inside.
+        Draw zones with that in mind on cameras with a lot of depth."""
+        if overlap_threshold is None:
+            overlap_threshold = ProcessAiHepper.DEFAULT_OVERLAP_THRESHOLD
         x1, y1, x2, y2 = bbox
         if x2 <= x1 or y2 <= y1:
             return False
-        anchor = (float((x1 + x2) * 0.5), float(y2))
-        return cv2.pointPolygonTest(polygon.astype(np.int32), anchor, False) >= 0
+        overlap = ProcessAiHepper.bbox_zone_overlap(bbox, polygon)
+        if overlap_threshold <= 0:
+            return overlap > 0.0
+        return overlap >= overlap_threshold
 
     @staticmethod
     def prepare_zones(polygon_points):
@@ -222,6 +235,30 @@ class ProcessAiHepper:
         confidence = np.array([d["score"] for d in raw_detections], dtype=np.float32)
         class_id = np.array([d["classId"] for d in raw_detections], dtype=int)
         return sv.Detections(xyxy=xyxy, confidence=confidence, class_id=class_id)
+
+    @staticmethod
+    def filter_track_classes(detections, class_ids):
+        """Narrow the tracker's input to the classes a service cares about.
+
+        This is deliberately *only* applied to what goes into the tracker.
+        `meta["detections"]` keeps every class the model found, so the debug
+        overlay and any downstream consumer still see the whole frame — only
+        the filtered classes come back carrying a tracker_id.
+
+        Contrast with AIJobSpec.class_filter, which drops classes inside the
+        C++ engine before the message is ever sent: that one removes them
+        from meta too. Use this when you want zone/tracking logic on one
+        class but still want to see the rest.
+
+        Falsy `class_ids` means "track every class"."""
+        if not class_ids or len(detections) == 0 or detections.class_id is None:
+            return detections
+        return detections[np.isin(detections.class_id, list(class_ids))]
+
+    @staticmethod
+    def get_track_class_ids(service_ai):
+        """Per-service tracking class whitelist, or None to track all."""
+        return getattr(service_ai, "TRACK_CLASS_IDS", None)
 
     @staticmethod
     def get_service_ai(type: str):
