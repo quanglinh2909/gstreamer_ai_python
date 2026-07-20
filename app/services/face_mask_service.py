@@ -102,25 +102,11 @@ class FaceMaskService:
         if parent is None:
             return
         key = (str(meta["cameraId"]), int(id))
-        x1 = parent.get("x1")
-        y1 = parent.get("y1")
-        x2 = parent.get("x2")
-        y2 = parent.get("y2")
       
         best_match_class_id = self._get_best_match_class_id(meta, parent)
 
         if best_match_class_id == 5:
             play_sound.q_play_sound.put({"link": "access/mask.mp3", "time": timestamp})
-            # push_event_metadata.push_event(
-            #                         track_uuid=id,
-            #                         timestamp=time.time(),
-            #                         mask_status="face-mask",
-            #                         bbox_x1=int(x1),
-            #                         bbox_y1=int(y1),
-            #                         bbox_x2=int(x2),
-            #                         bbox_y2=int(y2),
-            #                         image=full_jpeg
-            #                     )
         else:
             play_sound.q_play_sound.put({"link": "access/welcome.mp3", "time": timestamp})
         
@@ -145,7 +131,7 @@ class FaceMaskService:
     # Emit the alert (sound + event) for a confirmed class. Shared by the
     # first-time confirmation and the periodic re-alert path so both behave
     # identically.
-    def _fire_alert(self, id, class_id, meta, full_jpeg, x1, y1, x2, y2, timestamp):
+    def _fire_alert(self, id, class_id, meta, full_jpeg, x1, y1, x2, y2, timestamp,is_save=True):
         if class_id == 3:
             print(f"face_mask in_the_area id={id} - Face detected (no mask)")
             try:
@@ -154,20 +140,21 @@ class FaceMaskService:
             except Exception as e:
                 print(f"Failed to open barrier: {e}")
 
-
-            push_event_metadata.push_event(
-                track_uuid=id, timestamp=time.time(), mask_status="face",
-                bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
-                image=full_jpeg,
-            )
+            if is_save:
+                push_event_metadata.push_event(
+                    track_uuid=id, timestamp=time.time(), mask_status="face",
+                    bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
+                    image=full_jpeg,
+                )   
         elif class_id == 5:
             print(f"face_mask in_the_area id={id} - Mask detected")
             play_sound.q_play_sound.put({"link": "access/warning.mp3", "time": timestamp})
-            push_event_metadata.push_event(
-                track_uuid=id, timestamp=time.time(), mask_status="face-mask",
-                bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
-                image=full_jpeg,
-            )
+            if is_save:
+                push_event_metadata.push_event(
+                    track_uuid=id, timestamp=time.time(), mask_status="face-mask",
+                    bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
+                    image=full_jpeg,
+                )
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         parent = self._find_parent(meta, id)
@@ -213,14 +200,14 @@ class FaceMaskService:
                 hunmain_entry["class_id_confirm"] = best_match_class_id
                 hunmain_entry["last_alert_ts"] = timestamp
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
-                                 x1, y1, x2, y2, timestamp)
+                                 x1, y1, x2, y2, timestamp, is_save=True)
         elif re_alert_seconds > 0:
             # Already confirmed and still standing there — re-alert on interval.
             last_alert_ts = hunmain_entry.get("last_alert_ts", timestamp)
             if timestamp - last_alert_ts >= re_alert_seconds:
                 hunmain_entry["last_alert_ts"] = timestamp
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
-                                 x1, y1, x2, y2, timestamp)
+                                 x1, y1, x2, y2, timestamp, is_save=False)
         
         
 
