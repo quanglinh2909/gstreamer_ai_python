@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Manual control of the parking barriers. Wraps gpio_barrie_orangepi.open_barrie
-so an operator (or another service) can pulse a relay pin over HTTP without going
-through the face<->plate correlation worker."""
+
 import asyncio
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-
-from app.utils.orangepi_gpio import gpio_barrie_orangepi
+from app.utils.open_door.door_manager import door_manager
 
 router = APIRouter()
 prefix = "/barrier"
@@ -32,7 +29,7 @@ async def open_barrier(payload: OpenBarrierRequest):
     try:
         # open_barrie spins up a short-lived daemon thread per pin and returns
         # immediately, but keep it off the event loop in case GPIO.setup blocks.
-        await asyncio.to_thread(gpio_barrie_orangepi.open_barrie, payload.io_pin)
+        await asyncio.to_thread(door_manager.open_door, payload.io_pin)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to open barrier: {e}")
     return {"opened": True, "io_pin": payload.io_pin}

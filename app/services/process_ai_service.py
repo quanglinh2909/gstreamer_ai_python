@@ -250,6 +250,9 @@ class ProcessAiService:
                     "secondary_conf": ai_config.secondary_conf,
                     "primary_conf": ai_config.primary_conf,
                     "ai_type": ai_config.type,
+                    # Free-form per-config JSON forwarded to the service hooks.
+                    # Falls back to {} for rows saved before the column existed.
+                    "extra_data": ai_config.extra_data if ai_config.extra_data is not None else {},
                 }
             else:
                 state = self.process_ai[camera_id][job_id]
@@ -268,6 +271,7 @@ class ProcessAiService:
                 primary_conf = state.get("primary_conf", 0.3)
                 ai_type = state.get("ai_type")
                 track_class_ids = state.get("track_class_ids")
+                extra_data = state.get("extra_data") or {}
 
                 detections = ProcessAiHepper.to_sv_detections(meta.get("detections", []))
                 # Tracker sees only the service's classes; `meta` is left
@@ -285,32 +289,43 @@ class ProcessAiService:
                     tracker, detections, full_jpeg, ai_type=ai_type,
                 )
                 if detections.tracker_id is None or len(detections) == 0:
-                    # Even when the tracker rejected everything, push the
-                    # raw frame to any debug subscriber so they can see
-                    # the model's pre-tracker output (helps spot tracker
-                    # over-filtering). Cheap no-op when nobody's watching.
+                    # Nothing tracked this frame — but do NOT skip the zone
+                    # bookkeeping below. Walking out of frame is the most
+                    # common way to leave a zone, and it produces exactly
+                    # this: zero detections. Returning early here would
+                    # leave the tracker id in ids_in_zone forever, so its
+                    # exit_pending never counts up and exited_zone never
+                    # fires. Fall through with an empty set instead: every
+                    # id currently in a zone is simply "not seen", which is
+                    # what the exit grace is there to time out.
+                    #
+                    # Push the raw frame to any debug subscriber first so
+                    # they can still see the model's pre-tracker output
+                    # (helps spot tracker over-filtering). Cheap no-op when
+                    # nobody's watching.
                     self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons,
                                             primary_conf, overlap_threshold)
-                    continue
-                detections = detections[detections.tracker_id >= 0]
+                    detections = ProcessAiHepper.empty_tracked_detections()
+                else:
+                    detections = detections[detections.tracker_id >= 0]
 
-                raw_dets = meta.get("detections", [])
-                if len(detections) and raw_dets:
-                    raw_xyxy = np.array(
-                        [[d["x1"], d["y1"], d["x2"], d["y2"]] for d in raw_dets],
-                        dtype=np.float32,
-                    )
-                    for i in range(len(detections)):
-                        box = detections.xyxy[i]
-                        for j in range(len(raw_dets)):
-                            if np.array_equal(raw_xyxy[j], box):
-                                raw_dets[j]["tracker_id"] = int(detections.tracker_id[i])
-                                break
+                    raw_dets = meta.get("detections", [])
+                    if len(detections) and raw_dets:
+                        raw_xyxy = np.array(
+                            [[d["x1"], d["y1"], d["x2"], d["y2"]] for d in raw_dets],
+                            dtype=np.float32,
+                        )
+                        for i in range(len(detections)):
+                            box = detections.xyxy[i]
+                            for j in range(len(raw_dets)):
+                                if np.array_equal(raw_xyxy[j], box):
+                                    raw_dets[j]["tracker_id"] = int(detections.tracker_id[i])
+                                    break
 
-                # Stash with tracker_ids tagged onto raw_dets, so the
-                # MJPEG overlay can show them.
-                self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons,
-                                        primary_conf, overlap_threshold)
+                    # Stash with tracker_ids tagged onto raw_dets, so the
+                    # MJPEG overlay can show them.
+                    self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons,
+                                            primary_conf, overlap_threshold)
 
                 now = time.time()
                 for zone_idx, polygon in enumerate(polygons):
@@ -330,25 +345,25 @@ class ProcessAiService:
                         if tid not in ids_in_zone[zone_idx]:
                             # print(f"ID {tid} ENTERED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "entered_zone"):
-                                service_ai.entered_zone(tid, meta, full_jpeg, now, secondary_conf)
+                                service_ai.entered_zone(tid, meta, full_jpeg, now, secondary_conf, extra_data)
                             ids_in_zone[zone_idx].add(tid)
                             entered_at[zone_idx][tid] = now
                         elif dwell_seconds > 0 and tid not in dwell_alerted[zone_idx]:
                             if now - entered_at[zone_idx].get(tid, now) >= dwell_seconds:
                                 # print(f"ID {tid} STAYED in zone {zone_idx} for {dwell_seconds}s")
                                 if service_ai is not None and hasattr(service_ai, "dwell_alert"):
-                                    service_ai.dwell_alert(tid, meta, full_jpeg, now, secondary_conf)
+                                    service_ai.dwell_alert(tid, meta, full_jpeg, now, secondary_conf, extra_data)
                                 dwell_alerted[zone_idx].add(tid)
                         else:
                             if service_ai is not None and hasattr(service_ai, "in_the_area"):
-                                service_ai.in_the_area(tid, meta, full_jpeg, now, secondary_conf)
+                                service_ai.in_the_area(tid, meta, full_jpeg, now, secondary_conf, extra_data)
 
                     for tid in list(ids_in_zone[zone_idx] - current_ids):
                         exit_pending[zone_idx][tid] = exit_pending[zone_idx].get(tid, 0) + 1
                         if exit_pending[zone_idx][tid] >= exit_grace:
                             # print(f"ID {tid} EXITED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "exited_zone"):
-                                service_ai.exited_zone(tid, meta, full_jpeg, now, secondary_conf)
+                                service_ai.exited_zone(tid, meta, full_jpeg, now, secondary_conf, extra_data)
                             ids_in_zone[zone_idx].discard(tid)
                             exit_pending[zone_idx].pop(tid, None)
                             entered_at[zone_idx].pop(tid, None)

@@ -20,27 +20,27 @@ from app.ws.restricted_area_event_ws import restricted_area_event_broadcaster
 # "0,1" tells the C++ engine to drop every YOLO class except 0 and 1
 # before tracking — keeps unrelated objects out of the restricted-area
 # events entirely, no Python-side filter needed.
-# RESTRICTED_AREA_SPEC = AIJobSpec(
-#     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
-#     transform_data=None,
-#     name="restricted area",
-#     model_file_1="yolov8.rknn",
-#     model_file_2=None,
-#     model_type_1="yolov8_detect",
-#     model_type_2=None,
-#     class_filter="0",
-# )
-
 RESTRICTED_AREA_SPEC = AIJobSpec(
     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
     transform_data=None,
     name="restricted area",
-    model_file_1="yolov8-mask-s.rknn",
+    model_file_1="yolov8.rknn",
     model_file_2=None,
     model_type_1="yolov8_detect",
     model_type_2=None,
-    class_filter="0,3,5"
+    class_filter="0",
 )
+
+# RESTRICTED_AREA_SPEC = AIJobSpec(
+#     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
+#     transform_data=None,
+#     name="restricted area",
+#     model_file_1="yolov8-mask-s.rknn",
+#     model_file_2=None,
+#     model_type_1="yolov8_detect",
+#     model_type_2=None,
+#     class_filter="0,3,5"
+# )
 
 # RESTRICTED_AREA_SPEC = AIJobSpec(
 #     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
@@ -68,7 +68,7 @@ class RestrictedAreaService:
     # the message is built) this filters Python-side at the tracker input —
     # so meta["detections"] still lists every class the model saw and the
     # debug MJPEG overlay keeps showing them. Set to None to track all.
-    TRACK_CLASS_IDS = frozenset({0})
+    # TRACK_CLASS_IDS = frozenset({0})
 
     # (camera_id, tracker_id) -> timestamp of the last event written for that
     # tracker. A tracker that exits and re-enters within this window (brief
@@ -212,7 +212,7 @@ class RestrictedAreaService:
         except Exception as exc:
             print(f"restricted-area persist error: {exc}", file=sys.stderr)
 
-    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf):
+    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         parent = self._find_parent(meta, id)
         if parent is None:
             return
@@ -228,17 +228,17 @@ class RestrictedAreaService:
             self._persist_event(meta, parent, full_jpeg, id, timestamp)
         )
 
-    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf):
+    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         print(f"restricted_area dwell_alert id={id}")
 
-    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf):
+    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         # Keep recent stamps so a quick re-enter is still deduped, but drop
         # aged-out ones so the map can't grow without bound.
         cutoff = timestamp - self._REENTER_COOLDOWN_S
         self._last_saved = {k: t for k, t in self._last_saved.items() if t >= cutoff}
         print(f"restricted_area exited_zone id={id}")
 
-    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf):
+    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         # No re-persist while the tracker stays — entered_zone already
         # captured a row. dwell_alert handles "stayed too long".
         # print(meta)

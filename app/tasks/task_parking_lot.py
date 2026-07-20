@@ -7,7 +7,7 @@ from queue import Empty, Full, Queue
 
 import httpx
 
-from app.utils.orangepi_gpio import gpio_barrie_orangepi
+from app.utils.open_door.door_manager import door_manager
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -80,7 +80,7 @@ class TaskParkingLot:
 
     def _open_barrier(self, lot_id):
         try:
-            # gpio_barrie_orangepi.open_barrie(5)
+            door_manager.open_door(0.5)
             # response.raise_for_status()
             print(f"Barrier opened for parking lot {lot_id}")
         except Exception as e:

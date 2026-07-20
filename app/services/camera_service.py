@@ -58,6 +58,7 @@ class CameraService:
             ai_job["dwellSeconds"] = matched.dwell_seconds or 0
             ai_job["maxFps"] = matched.fps
             ai_job["job_id"] = matched.job_id
+            ai_job["extra_data"] = matched.extra_data or {}
         else:
             # Fallback for jobs that exist in the C++ engine but never
             # went through the Python upsert (no AIConfig row yet) —

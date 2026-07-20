@@ -18,3 +18,4 @@ psutil
 rknn-toolkit-lite2
 OPi.GPIO
 ultralytics
+python-vlc

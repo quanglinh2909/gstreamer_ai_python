@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     FACE_EMBEDDING_MODEL_PATH: Optional[str] = \
         "/home/orangepi/Documents/test/weights/adaface_ir101_fp16.rknn"
     FACE_DETECT_CONF: Optional[float] = 0.5
+    IS_OPEN_DOOR_WHEN_FACE_MASK: Optional[bool] = True
 
     class Config:
         env_file = ".env"

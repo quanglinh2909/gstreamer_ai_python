@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from app.core.config import settings
 from app.services.process_ai_service import process_ai_service
+from app.utils.play_sound import play_sound
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=task_parking_lot.worker, daemon=True).start()
     # Samples CPU/temp/memory/load/NPU/RGA every 10s into rolling 1-month tables.
     threading.Thread(target=task_system_metrics.worker, daemon=True).start()
+    threading.Thread(target=play_sound.play_sound, daemon=True).start()
     yield
     process_ai_service.stop()
     task_system_metrics.stop()

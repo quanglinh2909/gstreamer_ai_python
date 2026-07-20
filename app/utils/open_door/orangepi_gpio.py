@@ -43,7 +43,7 @@ class GPIOBarrieOrangePi:
         self.checkFist = False
 
 
-    def open_barrie(self, io_pin):
+    def open_barrie(self, io_pin, duration=0.5):
         if self.checkFist == False:
             GPIO.setup(3, GPIO.OUT)
             GPIO.setup(5, GPIO.OUT)
@@ -60,19 +60,19 @@ class GPIOBarrieOrangePi:
             self.checkFist = True
         if io_pin == 3 and self.checkInput3 is True:
             self.checkInput3 = False
-            threading.Thread(target=self.openTheading, args=(io_pin, self.setStatus3), daemon=True).start()
+            threading.Thread(target=self.openTheading, args=(io_pin, self.setStatus3, duration), daemon=True).start()
 
         if io_pin == 5 and self.checkInput5 is True:
             self.checkInput5 = False
-            threading.Thread(target=self.openTheading, args=(io_pin, self.setStatus5), daemon=True).start()
+            threading.Thread(target=self.openTheading, args=(io_pin, self.setStatus5, duration), daemon=True).start()
 
         if io_pin == 19 and self.checkInput19 is True:
             self.checkInput19 = False
-            threading.Thread(target=self.openTheading, args=(io_pin, self.setStatus19), daemon=True).start()
+            threading.Thread(target=self.openTheading, args=(io_pin, self.setStatus19, duration), daemon=True).start()
 
         if io_pin == 21 and self.checkInput21 is True:
             self.checkInput21 = False
-            threading.Thread(target=self.openTheading, args=(io_pin, self.setStatus21), daemon=True).start()
+            threading.Thread(target=self.openTheading, args=(io_pin, self.setStatus21, duration), daemon=True).start()
 
     def setStatus3(self):
         self.checkInput3 = True
@@ -86,10 +86,10 @@ class GPIOBarrieOrangePi:
     def setStatus21(self):
         self.checkInput21 = True
 
-    def openTheading(self, io_pin, setStatus):
+    def openTheading(self, io_pin, setStatus, duration=0.5):
         # Turn on the IO pin
         GPIO.output(io_pin, GPIO.LOW)
-        time.sleep(0.5)  # Chờ 1 giây
+        time.sleep(duration)
 
         # Turn off the IO pin
         GPIO.output(io_pin, GPIO.HIGH)

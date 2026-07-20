@@ -6,7 +6,7 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 import time
-from app.utils.orangepi_gpio import gpio_barrie_orangepi
+from app.utils.open_door.door_manager import door_manager
 
 from app.models.plate_white_list import PlateWhiteList
 from app.repositories.plate_white_list_repository import PlateWhiteListRepository
@@ -132,7 +132,7 @@ class PlateWhiteListService:
         with self._cache_lock:
             self.plate_white_list.pop(plate, None)
     
-    async def process_ai_result(self, plate_number: str):
+    async def process_ai_result(self, plate_number: str, pre_time: int = 10):
         plate_number = _normalize(plate_number)
         now = time.time()
         # Snapshot under the lock: API handlers (FastAPI thread) mutate this
@@ -143,9 +143,9 @@ class PlateWhiteListService:
                 (key, meta.get("last_matched", 0))
                 for key, meta in self.plate_white_list.items()
             ]
-        for key, pre_time in snapshot:
+        for key, last_matched in snapshot:
             _key = _normalize(key)
-            if Levenshtein.distance(plate_number, _key) <= 2 and now - pre_time > 10:
+            if Levenshtein.distance(plate_number, _key) <= 2 and now - last_matched > pre_time:
                 # Re-check + stamp under the lock; the entry may have been
                 # removed by a concurrent delete since the snapshot, and the
                 # stamp also rate-limits the next match (>10s apart).
@@ -155,13 +155,12 @@ class PlateWhiteListService:
                         continue
                     entry["last_matched"] = now
                 print(f"Plate {plate_number} matched whitelist entry {key} with distance {Levenshtein.distance(plate_number, _key)}")
-                async with httpx.AsyncClient() as client:
-                    try:
-                        gpio_barrie_orangepi.open_barrie(5)
-                        # response.raise_for_status()
-                        print(f"Barrier opened when plate {plate_number} matched whitelist entry {key}")
-                    except Exception as e:
-                        print(f"Failed to open barrier for plate {plate_number} matched whitelist entry {key}: {e}")
+                try:
+                    door_manager.open_door(0.5)
+                    # response.raise_for_status()
+                    print(f"Barrier opened when plate {plate_number} matched whitelist entry {key}")
+                except Exception as e:
+                    print(f"Failed to open barrier for plate {plate_number} matched whitelist entry {key}: {e}")
 
 
 

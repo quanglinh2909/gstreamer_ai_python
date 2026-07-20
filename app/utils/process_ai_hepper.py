@@ -8,6 +8,7 @@ import supervision as sv
 from trackers import BoTSORTTracker, ByteTrackTracker, OCSORTTracker
 
 from app.enum.config_ai_enum import TypeConfigAiEnum
+from app.services.face_mask_service import face_mask_service
 from app.services.face_recognition_service import face_recognition_service
 from app.services.plate_recognition_service import plate_recognition_service
 from app.services.restricted_area_service import restricted_area_service
@@ -15,17 +16,45 @@ from app.services.restricted_area_service import restricted_area_service
 
 
 class ProcessAiHepper:
+    # How long a lost track keeps its id, in wall-clock seconds. OC-SORT's
+    # ORU can re-acquire after a longer gap, so it gets a bigger window than
+    # the IoU-driven trackers.
+    _LOST_TRACK_SECONDS = {"botsort": 2.0, "bytetrack": 2.0}
+    _LOST_TRACK_SECONDS_DEFAULT = 3.0  # ocsort
+
+    @staticmethod
+    def lost_track_seconds(tracker_type="ocsort") -> float:
+        return ProcessAiHepper._LOST_TRACK_SECONDS.get(
+            tracker_type, ProcessAiHepper._LOST_TRACK_SECONDS_DEFAULT,
+        )
+
+    @staticmethod
+    def lost_track_buffer_param(tracker_type="ocsort") -> int:
+        """Value to hand the tracker as `lost_track_buffer`.
+
+        NOT a real frame count. Every tracker in the `trackers` lib does
+            maximum_frames_without_update = int(frame_rate / 30.0 * lost_track_buffer)
+        so the parameter is denominated in frames-at-a-nominal-30fps, and the
+        wall time it buys is `lost_track_buffer / 30` seconds *regardless of
+        fps*. The library already normalises for fps; scaling by fps here too
+        would double-count it."""
+        return int(round(ProcessAiHepper.lost_track_seconds(tracker_type) * 30.0))
+
     @staticmethod
     def lost_buffer_frames(tracker_type="ocsort", fps=15):
-        """How many frames a tracker keeps a lost track alive (and thus the
-        same tracker_id) before dropping it. The zone-exit grace in
+        """How many real frames the tracker keeps a lost track alive (and thus
+        the same tracker_id) before dropping it. The zone-exit grace in
         process_ai_service is sized off this so the zone never declares an
         object "exited" while the tracker still holds its id — otherwise a
         brief occlusion clears the per-tracker dedup state and the object
-        re-enters under the *same* id, producing a duplicate event."""
-        if tracker_type in ("botsort", "bytetrack"):
-            return max(10, int(fps * 2))
-        return max(15, int(fps * 3))  # ocsort default (~3s)
+        re-enters under the *same* id, producing a duplicate event.
+
+        Mirrors the library's own frame_rate/30 rescale (see
+        lost_track_buffer_param) so the two sides genuinely agree. Feeding the
+        raw param here instead is what silently desynced them: at fps=5 the
+        zone waited 15 frames while the tracker had already forgotten the id
+        after 2."""
+        return max(1, int(fps / 30.0 * ProcessAiHepper.lost_track_buffer_param(tracker_type)))
 
     @staticmethod
     def init_tracker(tracker_type="ocsort", threshold=0.25, fps=15):
@@ -33,12 +62,11 @@ class ProcessAiHepper:
         # high_conf_det_threshold must be <= threshold, otherwise no detection
         # ever counts as "high-confidence" and no new track can be spawned.
         high_conf = max(0.1, threshold - 0.1)
-        # Buffer in *wall time*, not raw frames. Default 30 frames at the
-        # tracker's nominal 30fps = 1s; at fps=5 that became 6s (too long,
-        # zombie tracks linger and steal IDs) and at fps=30 only 1s (too
-        # short, a one-frame detector miss kills the track). Target ~2s so
-        # a brief drop in detection still resumes onto the same tracker_id.
-        buffer = ProcessAiHepper.lost_buffer_frames(tracker_type, fps)
+        # Buffer in *wall time*, not raw frames — the library rescales this
+        # by frame_rate/30 itself, so it must be passed in nominal-30fps
+        # frames (seconds * 30) and NOT multiplied by fps here. See
+        # lost_track_buffer_param.
+        buffer = ProcessAiHepper.lost_track_buffer_param(tracker_type)
 
         if tracker_type == "botsort":
             return BoTSORTTracker(
@@ -160,15 +188,50 @@ class ProcessAiHepper:
         onto the original (unpadded) detections by index — downstream
         code keeps seeing the real bbox."""
         if len(detections) == 0:
-            return detections
+            # Tick the tracker even with nothing to feed it. OC-SORT /
+            # ByteTrack / BoTSORT age their lost tracks once per update()
+            # call, so returning early here freezes that ageing: the track
+            # never reaches lost_track_buffer, never dies, and whoever
+            # walks back in re-associates onto the *same* tracker_id — ids
+            # look permanently stuck at 0. It also silently breaks the
+            # "exit grace == lost buffer" contract the recv loop relies on,
+            # since only one side of it was still counting.
+            #
+            # BoTSORT tolerates frame=None, which matters: the C++ engine
+            # sends no JPEG when a frame has no detections.
+            empty = ProcessAiHepper.empty_tracked_detections()
+            if isinstance(tracker, BoTSORTTracker):
+                tracker.update(empty, ProcessAiHepper.decode_frame(full_jpeg))
+            else:
+                tracker.update(empty)
+            return empty
         padded = ProcessAiHepper._inflate_for_tracking(detections, ai_type)
         if isinstance(tracker, BoTSORTTracker):
             frame = ProcessAiHepper.decode_frame(full_jpeg)
             tracked = tracker.update(padded, frame)
         else:
             tracked = tracker.update(padded)
-        if tracked.tracker_id is not None and len(tracked) == len(detections):
-            detections.tracker_id = tracked.tracker_id
+
+        # Map ids back by bbox identity rather than by position. The trackers
+        # return only the boxes they kept, which is NOT always the full input:
+        # a detection scoring between high_conf_det_threshold and
+        # track_activation_threshold is dropped from the output entirely, so
+        # the count shrinks. The old `len(tracked) == len(detections)` guard
+        # then skipped the copy for the WHOLE frame — one borderline-score
+        # detection wiped the ids of every solidly-tracked object beside it,
+        # and the recv loop saw the frame as empty. Unmatched inputs get -1,
+        # which the recv loop already filters out.
+        #
+        # Safe because every tracker here echoes the input boxes verbatim
+        # (no Kalman-smoothed coordinates), so exact equality holds.
+        ids = np.full(len(detections), -1, dtype=int)
+        if tracked.tracker_id is not None and len(tracked):
+            for k in range(len(tracked)):
+                for j in range(len(padded.xyxy)):
+                    if ids[j] < 0 and np.array_equal(padded.xyxy[j], tracked.xyxy[k]):
+                        ids[j] = int(tracked.tracker_id[k])
+                        break
+        detections.tracker_id = ids
         return detections
 
     # Inflate profile per ai_type: (pad_l, pad_r, pad_t, pad_b) as ratios
@@ -221,6 +284,21 @@ class ProcessAiHepper:
         return cv2.imdecode(np.frombuffer(full_jpeg, np.uint8), cv2.IMREAD_COLOR)
 
     @staticmethod
+    def empty_tracked_detections():
+        """An empty result that still carries a tracker_id array.
+
+        `to_sv_detections([])` leaves tracker_id as None, which the zone
+        loop can't index. Returning a real empty array lets a
+        nothing-detected frame flow through the same code path as any
+        other, so exit bookkeeping keeps ticking."""
+        return sv.Detections(
+            xyxy=np.empty((0, 4), dtype=np.float32),
+            confidence=np.empty((0,), dtype=np.float32),
+            class_id=np.empty((0,), dtype=int),
+            tracker_id=np.empty((0,), dtype=int),
+        )
+
+    @staticmethod
     def to_sv_detections(raw_detections):
         if not raw_detections:
             return sv.Detections(
@@ -268,6 +346,8 @@ class ProcessAiHepper:
             return plate_recognition_service
         elif type == TypeConfigAiEnum.RESTRICTED_AREA.value:
             return restricted_area_service
+        elif type == TypeConfigAiEnum.FACE_MASK.value:
+            return face_mask_service
         else:
             return None
 

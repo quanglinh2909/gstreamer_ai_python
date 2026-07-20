@@ -88,7 +88,10 @@ class PlateRecognitionService:
         return re.sub(r'[^a-zA-Z0-9À-ỹ\s]', '', text_plate or "")
 
     async def plate_recognition(self, db: AsyncSession, req: PlateRecognitionDTO):
-        return await ai_job_service.upsert(db, req, PLATE_SPEC)
+        extra_data = {
+            "pre_time": req.pre_time if req.pre_time is not None else 10,
+        }
+        return await ai_job_service.upsert(db, req, PLATE_SPEC, extra_data=extra_data)
 
     async def test_inference(
         self,
@@ -226,7 +229,7 @@ class PlateRecognitionService:
             print(f"plate persist error: {exc}", file=sys.stderr)
 
     def _try_confirm_plate(self, meta, parent, full_jpeg, timestamp, secondary_conf,
-                           key, log_label, persist: bool = True):
+                           key, log_label, persist: bool = True, extra_data=None):
         """Read the plate text from the detection's OCR children. Returns
         True when the plate is confirmed (len >= _PLATE_MIN_LEN), False when
         we still need more frames. Also fires the whitelist/barrier task for
@@ -247,8 +250,9 @@ class PlateRecognitionService:
         # whitelist service itself rate-limits duplicate hits per plate.
         
         if len(t) >= _PLATE_WHITELIST_MIN_LEN:
+            pre_time = int((extra_data or {}).get("pre_time") or 10)
             asyncio.create_task(
-                plate_white_list_service.process_ai_result(text_plate)
+                plate_white_list_service.process_ai_result(text_plate, pre_time)
             )
         if len(t) < _PLATE_MIN_LEN:
             return False
@@ -283,7 +287,7 @@ class PlateRecognitionService:
         )
         return True
 
-    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf):
+    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         parent = self._find_parent(meta, id)
         if parent is None:
             return
@@ -294,13 +298,13 @@ class PlateRecognitionService:
         self._track_state[key] = _PENDING
         self._try_confirm_plate(
             meta, parent, full_jpeg, timestamp, secondary_conf,
-            key, "entered_zone",
+            key, "entered_zone", extra_data=extra_data,
         )
 
-    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf):
+    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         print(f"stayed_zone")
 
-    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf):
+    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         self._track_state.pop((str(meta["cameraId"]), int(id)), None)
         # Keep recent save stamps for the re-enter cooldown; drop aged-out
         # ones so the map can't grow without bound.
@@ -308,7 +312,7 @@ class PlateRecognitionService:
         self._last_saved = {k: t for k, t in self._last_saved.items() if t >= cutoff}
         print(f"Plate exited_zone")
 
-    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf):
+    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
         key = (str(meta["cameraId"]), int(id))
         state = self._track_state.get(key)
         # Ignore trackers that never entered the zone.
@@ -321,7 +325,7 @@ class PlateRecognitionService:
         # reading/whitelisting every frame but don't save a duplicate row.
         self._try_confirm_plate(
             meta, parent, full_jpeg, timestamp, secondary_conf,
-            key, "in_the_area", persist=(state == _PENDING),
+            key, "in_the_area", persist=(state == _PENDING), extra_data=extra_data,
         )
 
 

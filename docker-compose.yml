@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: postgres-parking
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oryza}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Oryza@123}
+      POSTGRES_DB: ${POSTGRES_DB:-parking}
+      # Giờ Việt Nam: TZ đặt giờ hệ điều hành trong container, PGTZ đặt
+      # timezone mặc định cho phiên kết nối Postgres.
+      TZ: Asia/Ho_Chi_Minh
+      PGTZ: Asia/Ho_Chi_Minh
+    # Ép luôn tham số server timezone để now()/CURRENT_TIMESTAMP trả giờ VN.
+    command: ["postgres", "-c", "timezone=Asia/Ho_Chi_Minh"]
+    ports:
+      # Map ra 5433 để khớp DATABASE_URL trong .env (localhost:5433).
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - parking_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oryza} -d ${POSTGRES_DB:-parking}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  # external: dùng lại đúng volume dữ liệu của container postgres-parking
+  # đang chạy, nên đổi sang compose KHÔNG mất dữ liệu hiện có.
+  # Nếu deploy máy mới (chưa có volume), bỏ dòng external và chạy:
+  #   docker volume create parking_postgres
+  parking_postgres:
+    external: true

@@ -63,7 +63,7 @@ class AIJobService:
     def _to_ratio(value: float) -> float:
         return value / 100.0 if value > 1 else value
 
-    async def upsert(self, db: AsyncSession, req, spec: AIJobSpec):
+    async def upsert(self, db: AsyncSession, req, spec: AIJobSpec, extra_data=None):
         req.primaryConf = self._to_ratio(req.primaryConf)
         req.secondaryConf = self._to_ratio(req.secondaryConf)
 
@@ -114,6 +114,7 @@ class AIJobService:
                 tracker=req.tracker,
                 overlap_threshold=req.overlap_threshold,
                 dwell_seconds=req.dwellSeconds,
+                extra_data=extra_data,
             ),
         )
         # Force the recv loop to reload tracker/polygons/thresholds for this

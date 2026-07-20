@@ -1,4 +1,4 @@
-from sqlalchemy import String
+from sqlalchemy import JSON, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -18,3 +18,9 @@ class AIConfig(Base):
     tracker: Mapped[str] = mapped_column(nullable=True)
     overlap_threshold: Mapped[float] = mapped_column(nullable=True)
     dwell_seconds: Mapped[int] = mapped_column(nullable=True, default=0)
+    # Free-form per-config JSON, forwarded to the service hooks (entered_zone,
+    # dwell_alert, exited_zone, in_the_area). Defaults to {} both at the ORM
+    # layer (default=dict) and in the DB (server_default '{}').
+    extra_data: Mapped[dict] = mapped_column(
+        JSON, nullable=False, default=dict, server_default=text("'{}'")
+    )
