@@ -111,16 +111,16 @@ class FaceMaskService:
 
         if best_match_class_id == 5:
             play_sound.q_play_sound.put({"link": "access/mask.mp3", "time": timestamp})
-            push_event_metadata.push_event(
-                                    track_uuid=id,
-                                    timestamp=time.time(),
-                                    mask_status="face-mask",
-                                    bbox_x1=int(x1),
-                                    bbox_y1=int(y1),
-                                    bbox_x2=int(x2),
-                                    bbox_y2=int(y2),
-                                    image=full_jpeg
-                                )
+            # push_event_metadata.push_event(
+            #                         track_uuid=id,
+            #                         timestamp=time.time(),
+            #                         mask_status="face-mask",
+            #                         bbox_x1=int(x1),
+            #                         bbox_y1=int(y1),
+            #                         bbox_x2=int(x2),
+            #                         bbox_y2=int(y2),
+            #                         image=full_jpeg
+            #                     )
         else:
             play_sound.q_play_sound.put({"link": "access/welcome.mp3", "time": timestamp})
         
