@@ -116,7 +116,7 @@ async def mjpeg(camera_id: str, job_id: str, request: Request):
                     draw_overlay,
                     frame["meta"], frame["full_jpeg"], frame["polygons"],
                     frame.get("primary_conf", 0.3), _DEBUG_DECODE_SCALE,
-                    frame.get("overlap_threshold"),
+                    frame.get("overlap_threshold"), frame.get("class_meta"),
                 )
                 if not annotated:
                     # draw_overlay refuses unrenderable frames (empty

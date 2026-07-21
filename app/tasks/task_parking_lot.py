@@ -27,7 +27,12 @@ UPLOADS_ROOT = os.path.join(
 
 
 class TaskParkingLot:
-    TIME_EXPIRED = 20  # thời gian lưu trữ thông tin (giây)
+    TIME_EXPIRED = 30  # thời gian lưu trữ thông tin (giây)
+    # Một biển số ở một làn chỉ được tạo MỘT sự kiện trong cửa sổ này. Chặn
+    # trường hợp 2 người ngồi cùng xe: cả 2 khuôn mặt đều khớp cùng một biển
+    # và mỗi mặt tạo một dòng + mở barrier một lần. Cửa sổ trượt: chừng nào
+    # biển còn được đọc liên tục (xe còn đứng ở làn) thì vẫn tiếp tục chặn.
+    MATCH_COOLDOWN = 30
 
     def __init__(self):
         # Bounded: every detection enqueues here, so a stalled consumer (slow
@@ -36,6 +41,11 @@ class TaskParkingLot:
         self.task_queue = Queue(maxsize=256)
         self.faces = {}
         self.plates = {}
+        # f"{plate_number}_{plate_camera_id}" -> ts của lần valid_success gần
+        # nhất. Tách khỏi self.plates vì entry trong self.plates có thể hết
+        # hạn rồi được tạo lại NGAY trong cùng một lượt xe — cờ matched gắn
+        # trên entry sẽ mất theo, còn dict này thì sống hết cooldown.
+        self.matches = {}
         # Strong refs to in-flight fire-and-forget BLE notifications so the
         # event loop doesn't garbage-collect them mid-request.
         self._bg_tasks = set()
@@ -47,7 +57,23 @@ class TaskParkingLot:
     async def valid_success(self, lot, identity_id, plate_number, face_jpeg, plate_jpeg):
         lot_id = lot["id"] if lot else None
         print(f"Valid success for parking lot {lot_id} (identity {identity_id}, plate {plate_number})")
-        # Save the two full-frame snapshots off the loop, persist, then open.
+        # Mở barrier TRƯỚC — đây là thứ người ở cổng đang chờ. Trước kia nó
+        # đứng CUỐI, sau 2 lần ghi ảnh + 1 lần ghi DB: bình thường chỉ tốn
+        # vài chục ms, nhưng khi DB chậm/rớt thì barrier phải đợi hết timeout
+        # của asyncpg. (open_door tự tách thread cho xung GPIO nên lệnh này
+        # trả về ngay.)
+        await asyncio.to_thread(self._open_barrier, lot_id)
+        # Lưu ảnh + ghi DB chạy NỀN để worker quay lại ghép cặp ngay lập tức
+        # — DB nghẽn không giữ chân barrier của xe kế tiếp / làn khác nữa.
+        bg = asyncio.create_task(
+            self._persist_success(lot, identity_id, plate_number, face_jpeg, plate_jpeg)
+        )
+        self._bg_tasks.add(bg)
+        bg.add_done_callback(self._bg_tasks.discard)
+
+    async def _persist_success(self, lot, identity_id, plate_number, face_jpeg, plate_jpeg):
+        # Background half of valid_success: snapshots to disk, then the DB row.
+        lot_id = lot["id"] if lot else None
         face_url = await asyncio.to_thread(
             self._save_image_blocking, face_jpeg, lot_id, "face",
         )
@@ -57,7 +83,6 @@ class TaskParkingLot:
         await self._persist_event(
             lot, identity_id, plate_number, face_url, plate_url,
         )
-        await asyncio.to_thread(self._open_barrier, lot_id)
 
     @staticmethod
     def _save_image_blocking(jpeg, lot_id, kind):
@@ -166,6 +191,15 @@ class TaskParkingLot:
         finally:
             await engine.dispose()
 
+    def _claim_match(self, plate_key, now):
+        """True nếu biển này (ở làn này) CHƯA tạo sự kiện trong cooldown —
+        đồng thời ghi nhận luôn. False = lượt xe này đã có sự kiện rồi
+        (ví dụ người thứ 2 ngồi cùng xe) -> bỏ qua, không tạo dòng mới."""
+        if now - self.matches.get(plate_key, 0) < self.MATCH_COOLDOWN:
+            return False
+        self.matches[plate_key] = now
+        return True
+
     async def _handle(self, task):
         # Drop entries older than the correlation window.
         now = time.time()
@@ -176,6 +210,10 @@ class TaskParkingLot:
         self.plates = {
             k: v for k, v in self.plates.items()
             if now - v["timestamp"] < self.TIME_EXPIRED
+        }
+        self.matches = {
+            k: v for k, v in self.matches.items()
+            if now - v < self.MATCH_COOLDOWN
         }
 
         name_task = task.get("task")
@@ -197,6 +235,13 @@ class TaskParkingLot:
                 # actual correlation when the plate arrives.
                 self.faces[key]["timestamp"] = timestamp
                 self.faces[key]["full_jpeg"] = full_jpeg
+                # Người vẫn đứng ở làn -> trượt luôn cửa sổ chống trùng của
+                # các biển liên quan, phòng ca camera biển bị che >20s rồi
+                # đọc lại biển trong cùng lượt xe.
+                for _plate_number in identity_plate_service.get_by_identity_id(identity_id):
+                    _pk = f"{_plate_number}_{_camera_plate}"
+                    if _pk in self.matches:
+                        self.matches[_pk] = now
                 return
 
             lot = parking_lot_service.get_by_camera_id(camera_id)
@@ -204,10 +249,18 @@ class TaskParkingLot:
             for plate_number in _plates:
                 plate_key = f"{plate_number}_{_camera_plate}"
                 if plate_key in self.plates:
-                    await self.valid_success(
-                        lot, identity_id, plate_number,
-                        full_jpeg, self.plates[plate_key].get("full_jpeg"),
-                    )
+                    if self._claim_match(plate_key, now):
+                        await self.valid_success(
+                            lot, identity_id, plate_number,
+                            full_jpeg, self.plates[plate_key].get("full_jpeg"),
+                        )
+                    else:
+                        # 2 người cùng xe: biển này vừa tạo sự kiện với khuôn
+                        # mặt khác rồi — không tạo dòng thứ 2 / mở cửa lần 2.
+                        print(
+                            f"[parking_lot] plate {plate_number} đã có sự kiện "
+                            f"trong lượt này, bỏ qua face {identity_id}"
+                        )
                     break
             print(f"Registering face {identity_id} from camera {camera_id}")
             self.faces[key] = {
@@ -241,6 +294,11 @@ class TaskParkingLot:
                 # first read. Skip the duplicate work (BLE + barrier) below.
                 self.plates[key]["timestamp"] = timestamp
                 self.plates[key]["full_jpeg"] = full_jpeg
+                # Xe còn đứng ở làn (biển vẫn đang được đọc) -> trượt luôn
+                # cửa sổ chống trùng, để mặt người thứ 2 nhận diện muộn vẫn
+                # không tạo thêm sự kiện cho cùng lượt xe.
+                if key in self.matches:
+                    self.matches[key] = now
                 return
 
             # Notify the BLE service for every co-owner of the plate, but
@@ -259,20 +317,28 @@ class TaskParkingLot:
 
             lot = parking_lot_service.get_by_camera_id(camera_id)
             # Open the barrier for whichever co-owner of the plate has a recent
-            # matching face — stop at the first hit.
+            # matching face — stop at the first hit. _claim_match chặn lượt xe
+            # đã có sự kiện (entry biển hết hạn rồi được đọc lại trong cùng
+            # lượt sẽ đi qua nhánh này lần nữa).
             for _data in _candidates:
                 _identity_id = _data["identity_id"]
                 _face_key = f"{_identity_id}_{_camera_face}"
                 if _face_key in self.faces:
-                    print(
-                        f"[parking_lot] match identity={_identity_id} "
-                        f"plate={plate_number} "
-                        f"mac_bluetooth={_data.get('mac_bluetooth')}"
-                    )
-                    await self.valid_success(
-                        lot, _identity_id, plate_number,
-                        self.faces[_face_key].get("full_jpeg"), full_jpeg,
-                    )
+                    if self._claim_match(key, now):
+                        print(
+                            f"[parking_lot] match identity={_identity_id} "
+                            f"plate={plate_number} "
+                            f"mac_bluetooth={_data.get('mac_bluetooth')}"
+                        )
+                        await self.valid_success(
+                            lot, _identity_id, plate_number,
+                            self.faces[_face_key].get("full_jpeg"), full_jpeg,
+                        )
+                    else:
+                        print(
+                            f"[parking_lot] plate {plate_number} đã có sự kiện "
+                            f"trong lượt này, bỏ qua"
+                        )
                     break
             print(f"Registering plate {plate_number} from camera {camera_id}")
             self.plates[key] = {

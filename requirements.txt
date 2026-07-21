@@ -15,7 +15,5 @@ pymilvus[milvus_lite]
 uvicorn[standard]
 python-Levenshtein
 psutil
-rknn-toolkit-lite2
 OPi.GPIO
-ultralytics
 python-vlc

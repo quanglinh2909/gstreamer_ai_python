@@ -1,5 +1,4 @@
 import asyncio
-import datetime
 import os
 import sys
 from typing import Optional
@@ -11,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.dto.face_recognition_dto import FaceRecognitionDTO
 from app.dto.identity_dto import FaceInfo
 from app.enum.config_ai_enum import TypeConfigAiEnum
@@ -19,9 +19,10 @@ from app.models.identity import Identity
 from app.repositories.event_face_repository import EventFaceRepository
 from app.repositories.face_vector_repository import FaceVectorRepository
 from app.services.ai_job_service import AIJobSpec, ai_job_service
+# UPLOADS_ROOT is re-exported here: identity_service imports it from this
+# module, and it now lives with the shared crop/save helpers.
+from app.services.ai_service_base import UPLOADS_ROOT, AIServiceBase
 from app.tasks.task_parking_lot import task_parking_lot
-from app.utils import face_embedder
-from app.utils.image_crop import fixed_size_crop
 from app.ws.face_event_ws import face_event_broadcaster
 
 # Per-tracker identification state. entered_zone seeds it, in_the_area drives
@@ -40,13 +41,9 @@ FACE_SPEC = AIJobSpec(
     model_type_2="face_recognition",
 )
 
-UPLOADS_ROOT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "uploads",
-)
+class FaceRecognitionService(AIServiceBase):
+    EVENT_FOLDER = "faces"
 
-
-class FaceRecognitionService:
     # (cameraId, tracker_id) -> timestamp of the last EventFace written for
     # that tracker. _track_state already prevents duplicate rows while a
     # tracker stays continuously in the zone; this guards the exit/re-enter
@@ -105,30 +102,71 @@ class FaceRecognitionService:
     ):
         return await EventFaceRepository.list_paginated(db, page, size, camera_id)
 
+    @staticmethod
+    def _pick_largest_face(result):
+        """Biggest detection that actually produced an embedding, as
+        (embedding, bbox, score). None when the image has no usable face.
+
+        Mirrors the old Python pipeline's "largest face wins" rule; a
+        detection without an embedding means align/AdaFace failed for it,
+        so it can't be registered."""
+        best = None
+        best_area = 0.0
+        for d in (result or {}).get("detections") or []:
+            embedding = FaceRecognitionService._extract_embedding(d)
+            if not embedding:
+                continue
+            x1, y1 = float(d.get("x1", 0.0)), float(d.get("y1", 0.0))
+            x2, y2 = float(d.get("x2", 0.0)), float(d.get("y2", 0.0))
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            if area > best_area:
+                best_area = area
+                best = (embedding, (x1, y1, x2, y2), float(d.get("score", 0.0)))
+        return best
+
     async def register_face(self, identity_id: int, image: tuple) -> FaceInfo:
-        """Register a face by extracting an embedding via the standalone Python
-        pipeline (YOLO pose → AdaFace align → AdaFace RKNN), matching the
-        reference ai_result_face.py. Independent from the C++ live inference
-        path so registration quality is not affected by camera/decode quirks."""
+        """Register a face through the C++ engine's one-shot inference
+        endpoint — the same YOLOv8-pose → align_face → AdaFace path the live
+        camera pipeline runs.
+
+        This used to run a separate Python pipeline (ultralytics YOLO +
+        RKNN AdaFace), which dragged torch into the backend for this single
+        endpoint and — more importantly — detected faces with a *different*
+        model than the live path, so a registered embedding came from a
+        slightly different crop than the one it would later be matched
+        against. Reusing the engine removes both problems; `test_inference`
+        above already goes through the same call."""
         image_bytes = image[1] if len(image) >= 2 else None
         if not image_bytes:
             raise HTTPException(status_code=400, detail="Empty image")
 
-        face = await asyncio.to_thread(face_embedder.extract_face_embedding, image_bytes)
+        result = await ai_job_service.inference_with_spec(
+            image=image,
+            spec=FACE_SPEC,
+            primary_conf=settings.FACE_DETECT_CONF or 0.5,
+            # Face embedding produces no stage-2 children, so there is
+            # nothing for a secondary threshold to filter.
+            secondary_conf=0.0,
+        )
+
+        face = self._pick_largest_face(result)
         if face is None:
             raise HTTPException(
                 status_code=400, detail="No face/embedding detected in image"
             )
+        embedding, bbox, score = face
 
+        # FaceVectorRepository L2-normalises on both insert and search, so the
+        # engine's raw AdaFace output (already ~unit norm) needs no extra work.
         milvus_id = await asyncio.to_thread(
             FaceVectorRepository.insert,
-            embedding=face.embedding,
+            embedding=embedding,
             identity_id=identity_id,
         )
 
         det_for_crop = {
-            "x1": face.bbox[0], "y1": face.bbox[1],
-            "x2": face.bbox[2], "y2": face.bbox[3],
+            "x1": bbox[0], "y1": bbox[1],
+            "x2": bbox[2], "y2": bbox[3],
         }
         paths = await asyncio.to_thread(
             self._save_identity_images_blocking,
@@ -140,8 +178,8 @@ class FaceRecognitionService:
 
         return FaceInfo(
             id=milvus_id,
-            score=face.score,
-            embedding=face.embedding,
+            score=score,
+            embedding=embedding,
             image_full=full_url,
             image_crop=crop_url,
         )
@@ -161,7 +199,7 @@ class FaceRecognitionService:
         img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return f"/uploads/{folder_rel}/full.jpg", None
-        crop = cls._make_face_crop(
+        crop = cls._make_crop(
             img,
             float(parent.get("x1", 0.0)), float(parent.get("y1", 0.0)),
             float(parent.get("x2", 0.0)), float(parent.get("y2", 0.0)),
@@ -172,13 +210,6 @@ class FaceRecognitionService:
             f"/uploads/{folder_rel}/full.jpg",
             f"/uploads/{folder_rel}/crop.jpg",
         )
-
-    @staticmethod
-    def _find_parent(meta, tid):
-        for d in meta.get("detections", []):
-            if d.get("tracker_id") == tid:
-                return d
-        return None
 
     # Face bbox is tight around the face. Pad outward when saving the event
     # crop so the picture includes hair, neck and shoulders — easier to read
@@ -194,55 +225,9 @@ class FaceRecognitionService:
     # tall after padding), so the crop is grown — not stretched — to fit.
     CROP_OUTPUT_W = 224
     CROP_OUTPUT_H = 280
-    CROP_PAD_COLOR = 114  # neutral grey for letterbox fill (matches YOLO)
-
-    @classmethod
-    def _make_face_crop(cls, img, bx1, by1, bx2, by2):
-        # vertical_bias="below" — when the padded box is wider than
-        # target, the extra room goes down into the body, not up above
-        # the head. Matches the old face-specific behaviour.
-        return fixed_size_crop(
-            img, bbox=(bx1, by1, bx2, by2),
-            pad_lrtb=(cls.CROP_PAD_LEFT, cls.CROP_PAD_RIGHT,
-                      cls.CROP_PAD_TOP, cls.CROP_PAD_BOTTOM),
-            output_size=(cls.CROP_OUTPUT_W, cls.CROP_OUTPUT_H),
-            pad_color=cls.CROP_PAD_COLOR,
-            vertical_bias="below",
-        )
-
-    @classmethod
-    def _save_images_blocking(cls, full_jpeg, meta, parent, tid):
-        if not full_jpeg:
-            return None
-        img = cv2.imdecode(np.frombuffer(full_jpeg, np.uint8), cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-
-        crop = cls._make_face_crop(
-            img,
-            float(parent["x1"]), float(parent["y1"]),
-            float(parent["x2"]), float(parent["y2"]),
-        )
-        if crop is None:
-            return None
-
-        date = datetime.date.today().isoformat()
-        folder_rel = os.path.join("faces", str(meta["cameraId"]), date)
-        folder_abs = os.path.join(UPLOADS_ROOT, folder_rel)
-        os.makedirs(folder_abs, exist_ok=True)
-
-        stem = f"{int(meta['seq']):010d}_{int(tid)}"
-        full_abs = os.path.join(folder_abs, f"{stem}_full.jpg")
-        crop_abs = os.path.join(folder_abs, f"{stem}_crop.jpg")
-
-        with open(full_abs, "wb") as fp:
-            fp.write(full_jpeg)
-        if not cv2.imwrite(crop_abs, crop):
-            return None
-        return (
-            f"/uploads/{folder_rel}/{stem}_full.jpg",
-            f"/uploads/{folder_rel}/{stem}_crop.jpg",
-        )
+    # When the padded box is wider than target, the extra room goes down
+    # into the body, not up above the head.
+    CROP_VERTICAL_BIAS = "below"
 
     @staticmethod
     def _extract_embedding(parent):

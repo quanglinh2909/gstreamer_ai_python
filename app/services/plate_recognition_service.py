@@ -1,12 +1,8 @@
 import asyncio
-import datetime
-import os
 import re
 import sys
 from typing import Optional
 
-import cv2
-import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dto.plate_recognition_dto import PlateRecognitionDTO
@@ -14,8 +10,8 @@ from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.models.event_plate import EventPlate
 from app.repositories.event_plate_repository import EventPlateRepository
 from app.services.ai_job_service import AIJobSpec, ai_job_service
+from app.services.ai_service_base import AIServiceBase
 from app.tasks.task_parking_lot import task_parking_lot
-from app.utils.image_crop import fixed_size_crop
 from app.utils.plate_recognition_hepper import detect_plate_from_children
 from app.services.plate_white_list_service import plate_white_list_service
 from app.ws.plate_event_ws import plate_event_broadcaster
@@ -58,14 +54,7 @@ _PLATE_MIN_LEN = 8
 # are good enough to recognise a known plate); independent of DB save.
 _PLATE_WHITELIST_MIN_LEN = 7
 
-# Project-root /uploads — same directory mounted as static in main.py.
-UPLOADS_ROOT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "uploads",
-)
-
-
-class PlateRecognitionService:
+class PlateRecognitionService(AIServiceBase):
     # (camera_id, tracker_id) -> timestamp of the last EventPlate written for
     # that tracker. _track_state stops duplicates while a car stays in the
     # zone; this guards the exit/re-enter case (the car briefly leaves the
@@ -115,12 +104,10 @@ class PlateRecognitionService:
     ):
         return await EventPlateRepository.list_paginated(db, page, size, camera_id)
 
-    @staticmethod
-    def _find_parent(meta, tid):
-        for d in meta.get("detections", []):
-            if d.get("tracker_id") == tid:
-                return d
-        return None
+    # `_find_parent` / `_make_crop` / `_save_images_blocking` come from
+    # AIServiceBase; only the crop geometry, upload folder and filename
+    # suffix differ.
+    EVENT_FOLDER = "plates"
 
     # Plate bbox from detection sits tight on the plate edges. Pad outward
     # before saving so the crop also shows a little of the surrounding car
@@ -137,52 +124,12 @@ class PlateRecognitionService:
     # source-extended horizontally and centred — never stretched.
     CROP_OUTPUT_W = 280
     CROP_OUTPUT_H = 120
-    CROP_PAD_COLOR = 114  # YOLO-style neutral grey for letterbox fill
 
     @classmethod
-    def _make_plate_crop(cls, img, bx1, by1, bx2, by2):
-        return fixed_size_crop(
-            img, bbox=(bx1, by1, bx2, by2),
-            pad_lrtb=(cls.CROP_PAD_LEFT, cls.CROP_PAD_RIGHT,
-                      cls.CROP_PAD_TOP, cls.CROP_PAD_BOTTOM),
-            output_size=(cls.CROP_OUTPUT_W, cls.CROP_OUTPUT_H),
-            pad_color=cls.CROP_PAD_COLOR,
-        )
-
-    @classmethod
-    def _save_images_blocking(cls, full_jpeg, meta, parent, text_plate):
-        if not full_jpeg:
-            return None
-        img = cv2.imdecode(np.frombuffer(full_jpeg, np.uint8), cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-
-        crop = cls._make_plate_crop(
-            img,
-            float(parent["x1"]), float(parent["y1"]),
-            float(parent["x2"]), float(parent["y2"]),
-        )
-        if crop is None:
-            return None
-
-        date = datetime.date.today().isoformat()
-        folder_rel = os.path.join("plates", str(meta["cameraId"]), date)
-        folder_abs = os.path.join(UPLOADS_ROOT, folder_rel)
-        os.makedirs(folder_abs, exist_ok=True)
-
-        safe_plate = re.sub(r"[^A-Za-z0-9_-]", "", text_plate) or "unknown"
-        stem = f"{int(meta['seq']):010d}_{safe_plate}"
-        full_abs = os.path.join(folder_abs, f"{stem}_full.jpg")
-        crop_abs = os.path.join(folder_abs, f"{stem}_crop.jpg")
-
-        with open(full_abs, "wb") as fp:
-            fp.write(full_jpeg)
-        if not cv2.imwrite(crop_abs, crop):
-            return None
-        return (
-            f"/uploads/{folder_rel}/{stem}_full.jpg",
-            f"/uploads/{folder_rel}/{stem}_crop.jpg",
-        )
+    def _stem_suffix(cls, text_plate):
+        # Plate images are named by the recognised text, not a tracker id,
+        # so strip anything that isn't filename-safe.
+        return re.sub(r"[^A-Za-z0-9_-]", "", text_plate) or "unknown"
 
     async def _persist_event(self, meta, parent, full_jpeg, text_plate, timestamp):
         # Lazy import avoids the circular dep at module load; by the time this

@@ -32,6 +32,43 @@ _FONT_THICKNESS = 3
 _DEFAULT_MIN_SCORE = 0.3
 
 
+def _resolve_color(value):
+    """Normalise a CLASS_META color into an OpenCV BGR tuple, or None.
+
+    Accepts either a 3-sequence already in BGR order (OpenCV native), or a
+    hex string "#RRGGBB" / "RRGGBB" written in the usual RGB order (what
+    people copy from a color picker) and flips it to BGR. Anything malformed
+    returns None so the caller falls back to the default zone color."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        h = value.strip().lstrip("#")
+        if len(h) != 6:
+            return None
+        try:
+            r = int(h[0:2], 16)
+            g = int(h[2:4], 16)
+            b = int(h[4:6], 16)
+        except ValueError:
+            return None
+        return (b, g, r)
+    try:
+        b, g, r = value
+        return (int(b), int(g), int(r))
+    except (TypeError, ValueError):
+        return None
+
+
+def _class_label(class_meta, class_id):
+    """Label for a detection's class: the CLASS_META name when provided,
+    else the plain `cls=<id>` fallback."""
+    if class_meta:
+        entry = class_meta.get(class_id)
+        if entry and entry.get("name"):
+            return str(entry["name"])
+    return f"cls={class_id if class_id is not None else '?'}"
+
+
 def _det_in_any_zone(bbox, polygons, overlap_threshold=None) -> bool:
     """True when the detection counts as 'in zone' by the same rule the
     recv loop uses (>= overlap_threshold of the bbox area inside the
@@ -72,7 +109,8 @@ def _draw_label(img, text, x, y, bg_color):
 def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
                  min_score: float = _DEFAULT_MIN_SCORE,
                  decode_scale: float = 1.0,
-                 overlap_threshold: float | None = None) -> bytes:
+                 overlap_threshold: float | None = None,
+                 class_meta: dict | None = None) -> bytes:
     # Defensive: process_ai_service already filters empty jpegs out, but
     # a race or future code path could still reach us with no bytes.
     # `imdecode` asserts on an empty buffer, which would tear the whole
@@ -118,9 +156,20 @@ def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
         fx2 = float(det.get("x2", 0))
         fy2 = float(det.get("y2", 0))
         bbox = np.array([fx1, fy1, fx2, fy2], dtype=np.float32)
-        color = (_IN_ZONE_COLOR
-                 if _det_in_any_zone(bbox, polygons, overlap_threshold)
-                 else _OUT_ZONE_COLOR)
+        class_id = det.get("classId")
+        # A per-class color (from the service's CLASS_META) wins over the
+        # default green/red in-zone verdict when provided; otherwise fall
+        # back to the zone-based coloring.
+        class_color = None
+        if class_meta:
+            entry = class_meta.get(class_id)
+            if entry:
+                class_color = _resolve_color(entry.get("color"))
+        color = class_color or (
+            _IN_ZONE_COLOR
+            if _det_in_any_zone(bbox, polygons, overlap_threshold)
+            else _OUT_ZONE_COLOR
+        )
         x1 = int(fx1 * s)
         y1 = int(fy1 * s)
         x2 = int(fx2 * s)
@@ -132,7 +181,7 @@ def draw_overlay(meta: dict, full_jpeg: bytes, polygons,
         tid = det.get("tracker_id")
         if tid is not None and tid >= 0:
             parts.append(f"id={int(tid)}")
-        parts.append(f"cls={det.get('classId', '?')}")
+        parts.append(_class_label(class_meta, class_id))
         parts.append(f"{float(det.get('score', 0.0)):.2f}")
         children = det.get("children")
         if children:

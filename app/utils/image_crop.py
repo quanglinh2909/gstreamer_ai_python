@@ -73,6 +73,26 @@ def fixed_size_crop(
             cy2 = mid_y + new_h * 0.5
         ch = new_h
 
+    # Step 2b: a window bigger than the source can never be filled with real
+    # pixels, and shifting (step 3) can't help — so scale it down, aspect
+    # intact, until it fits. The crop then shows slightly less padding than
+    # requested instead of grey bars. Close-up portraits hit this constantly:
+    # with a face-sized pad the window ends up wider than the photo itself.
+    fit = min(1.0, w / cw, h / ch)
+    if fit < 1.0:
+        new_w = cw * fit
+        new_h = ch * fit
+        mid_x = (cx1 + cx2) * 0.5
+        cx1 = mid_x - new_w * 0.5
+        cx2 = mid_x + new_w * 0.5
+        if vertical_bias == "below":
+            cy2 = cy1 + new_h      # keep the top anchor (face stays up top)
+        else:
+            mid_y = (cy1 + cy2) * 0.5
+            cy1 = mid_y - new_h * 0.5
+            cy2 = mid_y + new_h * 0.5
+        cw, ch = new_w, new_h
+
     # Step 3: shift the window inward when it falls off an edge — instead
     # of letterboxing. "Top out → take from below" and friends. Only when
     # the window is larger than the source in a dimension does any grey

@@ -1,14 +1,13 @@
-import asyncio
-import os
-from typing import Optional
+import time
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.utils.play_sound import play_sound
-from sqlalchemy.ext.asyncio import AsyncSession
-import time
 from app.utils.push_envent_metadata import push_event_metadata
 from app.dto.face_mask_dto import FaceMaskDTO
 from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.services.ai_job_service import AIJobSpec, ai_job_service
+from app.services.ai_service_base import AIServiceBase
 from app.utils.open_door.door_manager import door_manager
 
 
@@ -23,15 +22,20 @@ FACE_MASK_SPEC = AIJobSpec(
     class_filter="0,3,5"
 )
 
-UPLOADS_ROOT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "uploads",
-)
-
-
-class FaceMaskService:
+class FaceMaskService(AIServiceBase):
     TRACK_CLASS_IDS = frozenset({0})
 
+    # Debug-overlay metadata per classId (optional, cosmetic only — read by
+    # the MJPEG overlay in app/utils/ai_debug_overlay.py):
+    #   "name"  – hiển thị thay cho "cls=<id>" trong nhãn box.
+    #   "color" – tô màu box, ghi đè màu xanh/đỏ theo zone. Nhận tuple BGR
+    #             (kiểu OpenCV) hoặc chuỗi hex "#RRGGBB"/"RRGGBB" (RGB).
+    # Class nào không khai báo thì giữ nguyên hành vi cũ (cls=<id>, màu zone).
+    CLASS_META = {
+        0: {"name": "Person"},
+        3: {"name": "No Mask", "color":  "#34C759"},
+        5: {"name": "Mask", "color":"#FF3B30"},
+    }
 
     def __init__(self):
         self._hunmain: dict = {}
@@ -44,13 +48,10 @@ class FaceMaskService:
         return await ai_job_service.upsert(db, req, FACE_MASK_SPEC, extra_data=extra_data)
 
     # ─── Detection event hooks (driven by process_ai_service) ────────
-    @staticmethod
-    def _find_parent(meta, tid):
-        for d in meta.get("detections", []):
-            if d.get("tracker_id") == tid:
-                return d
-        return None
-    
+    # `_find_parent` comes from AIServiceBase. This service pushes events
+    # through push_event_metadata rather than the shared image-saving
+    # helper, so it needs no EVENT_FOLDER / crop geometry.
+
     def calculate_containment(self, person_box, face_box):
         """Tính tỷ lệ face nằm trong person (0-1)"""
         px1, py1, px2, py2 = person_box

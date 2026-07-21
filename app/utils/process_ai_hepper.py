@@ -339,6 +339,15 @@ class ProcessAiHepper:
         return getattr(service_ai, "TRACK_CLASS_IDS", None)
 
     @staticmethod
+    def get_class_meta(service_ai):
+        """Per-service debug-overlay metadata keyed by classId, or None.
+
+        Shape: {classId: {"name": str, "color": <BGR tuple | "#RRGGBB">}}.
+        Both keys optional — `name` relabels the box, `color` recolors it.
+        Purely cosmetic; only the debug MJPEG overlay reads it."""
+        return getattr(service_ai, "CLASS_META", None)
+
+    @staticmethod
     def get_service_ai(type: str):
         if type == TypeConfigAiEnum.FACE_RECOGNITION.value:
             return face_recognition_service
