@@ -287,7 +287,7 @@ class PlateRecognitionService:
         )
         return True
 
-    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         parent = self._find_parent(meta, id)
         if parent is None:
             return
@@ -301,10 +301,10 @@ class PlateRecognitionService:
             key, "entered_zone", extra_data=extra_data,
         )
 
-    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         print(f"stayed_zone")
 
-    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         self._track_state.pop((str(meta["cameraId"]), int(id)), None)
         # Keep recent save stamps for the re-enter cooldown; drop aged-out
         # ones so the map can't grow without bound.
@@ -312,7 +312,7 @@ class PlateRecognitionService:
         self._last_saved = {k: t for k, t in self._last_saved.items() if t >= cutoff}
         print(f"Plate exited_zone")
 
-    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         key = (str(meta["cameraId"]), int(id))
         state = self._track_state.get(key)
         # Ignore trackers that never entered the zone.

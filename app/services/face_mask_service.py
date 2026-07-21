@@ -8,8 +8,6 @@ import time
 from app.utils.push_envent_metadata import push_event_metadata
 from app.dto.face_mask_dto import FaceMaskDTO
 from app.enum.config_ai_enum import TypeConfigAiEnum
-from app.models.restricted_areas import RestrictedArea
-from app.repositories.restricted_area_repository import RestrictedAreaRepository
 from app.services.ai_job_service import AIJobSpec, ai_job_service
 from app.utils.open_door.door_manager import door_manager
 
@@ -97,33 +95,37 @@ class FaceMaskService:
         return best_match_class_id
 
     
-    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         parent = self._find_parent(meta, id)
         if parent is None:
             return
-        key = (str(meta["cameraId"]), int(id))
-      
-        best_match_class_id = self._get_best_match_class_id(meta, parent)
+        key = (str(meta["cameraId"]), int(id), int(zone_idx))
 
+        best_match_class_id = self._get_best_match_class_id(meta, parent)
         if best_match_class_id == 5:
             play_sound.q_play_sound.put({"link": "access/mask.mp3", "time": timestamp})
         else:
             play_sound.q_play_sound.put({"link": "access/welcome.mp3", "time": timestamp})
-        
+
         self._hunmain[key] = {
             "timestamp": timestamp,
             "class_id_pre": best_match_class_id,
-            "class_id_confirm":None,
-            "count_confirm": 1 if best_match_class_id != "UNKNOWN" else 0
+            # Bắt đầu ở trạng thái CHƯA confirm cho mọi class (kể cả mask) để
+            # mask cũng đi qua count_confirm giống face -> lưu event nhất quán.
+            "class_id_confirm": None,
+            "count_confirm": 1 if best_match_class_id != "UNKNOWN" else 0,
+            # Người vào đã đeo khẩu trang sẵn thì đã được chào bằng mask.mp3;
+            # khi confirm lại class 5 thì lưu event nhưng KHÔNG phát warning.mp3.
+            "greeted_mask_at_entry": best_match_class_id == 5,
         }
         
 
-    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
-        print(f"restricted_area dwell_alert id={id}")
+    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
+        print(f"face_mask dwell_alert id={id}")
 
-    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
-        key = (str(meta["cameraId"]), int(id))
-        print(f"restricted_area exited_zone id={id}")
+    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
+        key = (str(meta["cameraId"]), int(id), int(zone_idx))
+        print(f"face_mask exited_zone id={id}")
 
         if key in self._hunmain:
             del self._hunmain[key]
@@ -131,7 +133,7 @@ class FaceMaskService:
     # Emit the alert (sound + event) for a confirmed class. Shared by the
     # first-time confirmation and the periodic re-alert path so both behave
     # identically.
-    def _fire_alert(self, id, class_id, meta, full_jpeg, x1, y1, x2, y2, timestamp,is_save=True):
+    def _fire_alert(self, id, class_id, meta, full_jpeg, x1, y1, x2, y2, timestamp, is_save=True, alert_sound=True):
         if class_id == 3:
             print(f"face_mask in_the_area id={id} - Face detected (no mask)")
             try:
@@ -145,10 +147,11 @@ class FaceMaskService:
                     track_uuid=id, timestamp=time.time(), mask_status="face",
                     bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
                     image=full_jpeg,
-                )   
+                )
         elif class_id == 5:
             print(f"face_mask in_the_area id={id} - Mask detected")
-            play_sound.q_play_sound.put({"link": "access/warning.mp3", "time": timestamp})
+            if alert_sound:
+                play_sound.q_play_sound.put({"link": "access/warning.mp3", "time": timestamp})
             if is_save:
                 push_event_metadata.push_event(
                     track_uuid=id, timestamp=time.time(), mask_status="face-mask",
@@ -156,11 +159,11 @@ class FaceMaskService:
                     image=full_jpeg,
                 )
 
-    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         parent = self._find_parent(meta, id)
         if parent is None:
             return
-        key = (str(meta["cameraId"]), int(id))
+        key = (str(meta["cameraId"]), int(id), int(zone_idx))
         hunmain_entry = self._hunmain.get(key)
         if hunmain_entry is None:
             return
@@ -193,6 +196,12 @@ class FaceMaskService:
 
         hunmain_entry["count_confirm"] = count_confirm + 1
 
+        # Người vào đã đeo khẩu trang sẵn -> đã chào bằng mask.mp3 lúc vào,
+        # nên khi confirm/re-alert class 5 thì tắt warning.mp3 (vẫn lưu event).
+        alert_sound = not (
+            best_match_class_id == 5 and hunmain_entry.get("greeted_mask_at_entry")
+        )
+
         if hunmain_entry.get("class_id_confirm") != best_match_class_id:
             # Not yet confirmed for this class — fire once the streak is long
             # enough, then remember when we alerted.
@@ -200,14 +209,16 @@ class FaceMaskService:
                 hunmain_entry["class_id_confirm"] = best_match_class_id
                 hunmain_entry["last_alert_ts"] = timestamp
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
-                                 x1, y1, x2, y2, timestamp, is_save=True)
+                                 x1, y1, x2, y2, timestamp, is_save=True,
+                                 alert_sound=alert_sound)
         elif re_alert_seconds > 0:
             # Already confirmed and still standing there — re-alert on interval.
             last_alert_ts = hunmain_entry.get("last_alert_ts", timestamp)
             if timestamp - last_alert_ts >= re_alert_seconds:
                 hunmain_entry["last_alert_ts"] = timestamp
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
-                                 x1, y1, x2, y2, timestamp, is_save=False)
+                                 x1, y1, x2, y2, timestamp, is_save=False,
+                                 alert_sound=alert_sound)
         
         
 

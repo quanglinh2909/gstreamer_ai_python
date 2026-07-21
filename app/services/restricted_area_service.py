@@ -212,7 +212,7 @@ class RestrictedAreaService:
         except Exception as exc:
             print(f"restricted-area persist error: {exc}", file=sys.stderr)
 
-    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         parent = self._find_parent(meta, id)
         if parent is None:
             return
@@ -228,17 +228,17 @@ class RestrictedAreaService:
             self._persist_event(meta, parent, full_jpeg, id, timestamp)
         )
 
-    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         print(f"restricted_area dwell_alert id={id}")
 
-    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         # Keep recent stamps so a quick re-enter is still deduped, but drop
         # aged-out ones so the map can't grow without bound.
         cutoff = timestamp - self._REENTER_COOLDOWN_S
         self._last_saved = {k: t for k, t in self._last_saved.items() if t >= cutoff}
         print(f"restricted_area exited_zone id={id}")
 
-    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None):
+    def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         # No re-persist while the tracker stays — entered_zone already
         # captured a row. dwell_alert handles "stayed too long".
         # print(meta)

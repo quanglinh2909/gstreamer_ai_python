@@ -345,25 +345,25 @@ class ProcessAiService:
                         if tid not in ids_in_zone[zone_idx]:
                             # print(f"ID {tid} ENTERED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "entered_zone"):
-                                service_ai.entered_zone(tid, meta, full_jpeg, now, secondary_conf, extra_data)
+                                service_ai.entered_zone(tid, meta, full_jpeg, now, secondary_conf, extra_data, zone_idx)
                             ids_in_zone[zone_idx].add(tid)
                             entered_at[zone_idx][tid] = now
                         elif dwell_seconds > 0 and tid not in dwell_alerted[zone_idx]:
                             if now - entered_at[zone_idx].get(tid, now) >= dwell_seconds:
                                 # print(f"ID {tid} STAYED in zone {zone_idx} for {dwell_seconds}s")
                                 if service_ai is not None and hasattr(service_ai, "dwell_alert"):
-                                    service_ai.dwell_alert(tid, meta, full_jpeg, now, secondary_conf, extra_data)
+                                    service_ai.dwell_alert(tid, meta, full_jpeg, now, secondary_conf, extra_data, zone_idx)
                                 dwell_alerted[zone_idx].add(tid)
                         else:
                             if service_ai is not None and hasattr(service_ai, "in_the_area"):
-                                service_ai.in_the_area(tid, meta, full_jpeg, now, secondary_conf, extra_data)
+                                service_ai.in_the_area(tid, meta, full_jpeg, now, secondary_conf, extra_data, zone_idx)
 
                     for tid in list(ids_in_zone[zone_idx] - current_ids):
                         exit_pending[zone_idx][tid] = exit_pending[zone_idx].get(tid, 0) + 1
                         if exit_pending[zone_idx][tid] >= exit_grace:
                             # print(f"ID {tid} EXITED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "exited_zone"):
-                                service_ai.exited_zone(tid, meta, full_jpeg, now, secondary_conf, extra_data)
+                                service_ai.exited_zone(tid, meta, full_jpeg, now, secondary_conf, extra_data, zone_idx)
                             ids_in_zone[zone_idx].discard(tid)
                             exit_pending[zone_idx].pop(tid, None)
                             entered_at[zone_idx].pop(tid, None)
