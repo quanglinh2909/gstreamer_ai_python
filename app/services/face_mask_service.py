@@ -44,6 +44,9 @@ class FaceMaskService(AIServiceBase):
         extra_data = {
             "count_confirm": req.count_confirm if req.count_confirm is not None else 3,
             "re_alert_seconds": req.re_alert_seconds if req.re_alert_seconds is not None else 0,
+            "barrier_duration": (
+                req.barrier_duration if req.barrier_duration is not None else 0.5
+            ),
         }
         return await ai_job_service.upsert(db, req, FACE_MASK_SPEC, extra_data=extra_data)
 
@@ -134,11 +137,12 @@ class FaceMaskService(AIServiceBase):
     # Emit the alert (sound + event) for a confirmed class. Shared by the
     # first-time confirmation and the periodic re-alert path so both behave
     # identically.
-    def _fire_alert(self, id, class_id, meta, full_jpeg, x1, y1, x2, y2, timestamp, is_save=True, alert_sound=True):
+    def _fire_alert(self, id, class_id, meta, full_jpeg, x1, y1, x2, y2, timestamp,
+                    is_save=True, alert_sound=True, barrier_duration=0.5):
         if class_id == 3:
             print(f"face_mask in_the_area id={id} - Face detected (no mask)")
             try:
-                door_manager.open_door(0.5)
+                door_manager.open_door(barrier_duration)
                 print(f"Barrier opened ")
             except Exception as e:
                 print(f"Failed to open barrier: {e}")
@@ -173,9 +177,13 @@ class FaceMaskService(AIServiceBase):
         #   count_confirm    – consecutive same-class frames before alerting.
         #   re_alert_seconds – if > 0, alert again every N seconds while the
         #                      same person keeps standing in the zone.
+        #   barrier_duration – độ dài xung mở barrier (giây), tuỳ phần cứng cổng.
         extra = extra_data or {}
         confirm_threshold = int(extra.get("count_confirm") or 3)
         re_alert_seconds = int(extra.get("re_alert_seconds") or 0)
+        # `or 0.5` bắt cả None lẫn 0: xung 0 giây thì barrier không nhận được
+        # tín hiệu, coi như cổng hỏng — rơi về mặc định an toàn hơn.
+        barrier_duration = float(extra.get("barrier_duration") or 0.5)
 
         best_match_class_id = self._get_best_match_class_id(meta, parent)
 
@@ -211,7 +219,8 @@ class FaceMaskService(AIServiceBase):
                 hunmain_entry["last_alert_ts"] = timestamp
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
                                  x1, y1, x2, y2, timestamp, is_save=True,
-                                 alert_sound=alert_sound)
+                                 alert_sound=alert_sound,
+                                 barrier_duration=barrier_duration)
         elif re_alert_seconds > 0:
             # Already confirmed and still standing there — re-alert on interval.
             last_alert_ts = hunmain_entry.get("last_alert_ts", timestamp)
@@ -219,7 +228,8 @@ class FaceMaskService(AIServiceBase):
                 hunmain_entry["last_alert_ts"] = timestamp
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
                                  x1, y1, x2, y2, timestamp, is_save=False,
-                                 alert_sound=alert_sound)
+                                 alert_sound=alert_sound,
+                                 barrier_duration=barrier_duration)
         
         
 

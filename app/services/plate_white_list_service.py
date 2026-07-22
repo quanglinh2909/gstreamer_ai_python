@@ -10,6 +10,10 @@ from app.utils.open_door.door_manager import door_manager
 
 from app.models.plate_white_list import PlateWhiteList
 from app.repositories.plate_white_list_repository import PlateWhiteListRepository
+from app.services.plate_white_list_settings_service import (
+    plate_white_list_settings_service,
+)
+from app.utils.plate_recognition_hepper import detect_plate_from_children
 
 
 def _normalize(plate_number: str) -> str:
@@ -29,15 +33,30 @@ def _clean_name(name: Optional[str]) -> Optional[str]:
 
 class PlateWhiteListService:
     def __init__(self):
-        # plate_number (normalised, UPPER) -> {} (placeholder).
+        # plate_number (normalised, UPPER) -> {"last_matched": {camera_id: ts}}.
         # The ALPR hot path only needs membership ("is this plate
-        # whitelisted?"), so the value stays an empty dict — leaving
-        # room to attach per-plate metadata later without changing the
-        # shape. Lookups stay O(1).
+        # whitelisted?"), so a plate that has never opened a barrier keeps an
+        # empty dict; process_ai_result fills in the per-camera timestamps it
+        # uses for rate limiting. Lookups stay O(1).
         self.plate_white_list: Dict[str, Dict] = {}
         # Cross-thread access: API handlers (FastAPI loop) mutate; the
         # process_ai_service thread reads on every detection.
         self._cache_lock = threading.RLock()
+        # camera_id đã in cảnh báo "chưa cấu hình". Bỏ qua trong im lặng thì
+        # rất khó hiểu tại sao cổng không mở, nhưng in mỗi frame thì ngập log
+        # — nên in đúng một lần cho mỗi camera.
+        self._warned_unconfigured = set()
+
+    def _warn_unconfigured(self, camera_id: str) -> None:
+        with self._cache_lock:
+            if camera_id in self._warned_unconfigured:
+                return
+            self._warned_unconfigured.add(camera_id)
+        print(
+            f"[plate whitelist] camera {camera_id} chua co "
+            f"plate_white_list_settings -> bo qua whitelist/barrier. "
+            f"Cau hinh: PUT /plate-white-list-settings/{camera_id}"
+        )
 
     async def load_all(self, db: AsyncSession) -> None:
         """Prime the in-memory cache from DB. Call once at app startup
@@ -132,35 +151,105 @@ class PlateWhiteListService:
         with self._cache_lock:
             self.plate_white_list.pop(plate, None)
     
-    async def process_ai_result(self, plate_number: str, pre_time: int = 10):
-        plate_number = _normalize(plate_number)
+    async def process_ai_result(self, children, camera_id: str):
+        """Đọc biển từ các OCR children rồi đối chiếu whitelist và mở barrier.
+
+        Nhánh whitelist TỰ đọc biển bằng ngưỡng ocr_confidence của chính
+        camera đó, không dùng lại chuỗi biển mà plate_recognition_service đã
+        dựng bằng secondaryConf của AI job. Hai nhánh phục vụ hai mục đích
+        khác nhau — bên kia lưu EventPlate để người xem lại, bên này quyết
+        định có mở cổng hay không — nên siết ngưỡng cho cổng không kéo theo
+        thay đổi dữ liệu sự kiện, và ngược lại.
+
+        Mọi ngưỡng đều lấy từ PlateWhiteListSettings của camera (đọc từ cache
+        trong RAM, không truy vấn DB) nên gọi hàm này ở mọi frame là an toàn.
+        Camera chưa có dòng cấu hình thì KHÔNG chạy gì cả.
+        """
+        camera_id = str(camera_id)
+        cfg = plate_white_list_settings_service.get_cached(camera_id)
+        if cfg is None:
+            self._warn_unconfigured(camera_id)
+            return
+
+        # Ký tự yếu hơn ocr_confidence bị LOẠI khỏi chuỗi (không phải chặn cả
+        # lần đọc), nên biển đọc ra ngắn đi và thường rớt ngay ở
+        # min_plate_length bên dưới.
+        plate_number = _normalize(
+            detect_plate_from_children(children, cfg.ocr_confidence)
+        )
+
+        # Đọc thiếu ký tự thì bỏ qua ngay — rẻ hơn nhiều so với quét toàn bộ
+        # whitelist, và đây là nguyên nhân chính gây mở nhầm cổng.
+        if len(plate_number) < cfg.min_plate_length:
+            return
+
         now = time.time()
         # Snapshot under the lock: API handlers (FastAPI thread) mutate this
         # dict via create/update/delete while we run on the recv-loop thread,
         # so iterating it directly risks "dict changed size during iteration".
+        #
+        # last_matched tách theo camera: cổng vào và cổng ra là hai camera
+        # khác nhau, xe vừa vào không được vì thế mà bị khoá ở cổng ra.
         with self._cache_lock:
             snapshot = [
-                (key, meta.get("last_matched", 0))
+                (key, meta.get("last_matched", {}).get(camera_id, 0.0))
                 for key, meta in self.plate_white_list.items()
             ]
+        # Chọn biển GẦN NHẤT rồi mới xét thời gian chờ, chứ không lấy biển
+        # đầu tiên nằm dưới ngưỡng. Với max_edit_distance > 0, một chuỗi đọc
+        # được có thể khớp nhiều biển cùng lúc (biển VN hay chỉ khác nhau 1-2
+        # ký tự); lấy biển đầu tiên gặp thì thứ tự dict quyết định xe nào
+        # được ghi nhận, và tệ hơn: khi biển đúng đang trong thời gian chờ,
+        # một biển gần giống sẽ lọt qua và mở cổng thay nó.
+        #
+        # Key trong cache đã được _normalize lúc create/update/load_all nên
+        # không chuẩn hoá lại ở đây — vòng lặp này chạy mỗi frame.
+        best_key = None
+        best_distance = None
+        best_last_matched = 0.0
         for key, last_matched in snapshot:
-            _key = _normalize(key)
-            if Levenshtein.distance(plate_number, _key) <= 2 and now - last_matched > pre_time:
-                # Re-check + stamp under the lock; the entry may have been
-                # removed by a concurrent delete since the snapshot, and the
-                # stamp also rate-limits the next match (>10s apart).
-                with self._cache_lock:
-                    entry = self.plate_white_list.get(key)
-                    if entry is None:
-                        continue
-                    entry["last_matched"] = now
-                print(f"Plate {plate_number} matched whitelist entry {key} with distance {Levenshtein.distance(plate_number, _key)}")
-                try:
-                    door_manager.open_door(0.5)
-                    # response.raise_for_status()
-                    print(f"Barrier opened when plate {plate_number} matched whitelist entry {key}")
-                except Exception as e:
-                    print(f"Failed to open barrier for plate {plate_number} matched whitelist entry {key}: {e}")
+            distance = Levenshtein.distance(plate_number, key)
+            if distance > cfg.max_edit_distance:
+                continue
+            # Hoà thì lấy key nhỏ hơn theo thứ tự chữ cái, để cùng một chuỗi
+            # đọc được luôn cho ra cùng một kết quả bất kể thứ tự dict.
+            if (
+                best_distance is None
+                or distance < best_distance
+                or (distance == best_distance and key < best_key)
+            ):
+                best_key = key
+                best_distance = distance
+                best_last_matched = last_matched
+            if distance == 0:
+                break  # khớp tuyệt đối, không thể có kết quả tốt hơn
+
+        if best_key is None:
+            return
+        if best_last_matched:
+            if cfg.pre_time <= 0:
+                # 0 = không cho mở lại: biển này đã mở một lần rồi.
+                return
+            if now - best_last_matched <= cfg.pre_time:
+                return
+
+        # Re-check + stamp under the lock; the entry may have been removed by
+        # a concurrent delete since the snapshot, and the stamp also rate-
+        # limits the next match (pre_time giây).
+        with self._cache_lock:
+            entry = self.plate_white_list.get(best_key)
+            if entry is None:
+                return
+            entry.setdefault("last_matched", {})[camera_id] = now
+        print(
+            f"Plate {plate_number} matched whitelist entry {best_key} "
+            f"with distance {best_distance} (camera {camera_id})"
+        )
+        try:
+            door_manager.open_door(cfg.barrier_duration)
+            print(f"Barrier opened when plate {plate_number} matched whitelist entry {best_key}")
+        except Exception as e:
+            print(f"Failed to open barrier for plate {plate_number} matched whitelist entry {best_key}: {e}")
 
 
 

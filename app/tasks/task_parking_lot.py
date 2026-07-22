@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.models.parking_lot_event import ParkingLotEvent
 from app.services.parking_lot_service import parking_lot_service
 from app.services.identity_plate_service import identity_plate_service
+from app.utils.plate_recognition_hepper import detect_plate_from_children
 
 # Project-root /uploads — same directory mounted as static in main.py.
 UPLOADS_ROOT = os.path.join(
@@ -27,24 +28,27 @@ UPLOADS_ROOT = os.path.join(
 
 
 class TaskParkingLot:
-    TIME_EXPIRED = 30  # thời gian lưu trữ thông tin (giây)
-    # Một biển số ở một làn chỉ được tạo MỘT sự kiện trong cửa sổ này. Chặn
-    # trường hợp 2 người ngồi cùng xe: cả 2 khuôn mặt đều khớp cùng một biển
-    # và mỗi mặt tạo một dòng + mở barrier một lần. Cửa sổ trượt: chừng nào
-    # biển còn được đọc liên tục (xe còn đứng ở làn) thì vẫn tiếp tục chặn.
-    MATCH_COOLDOWN = 30
+    # Mọi ngưỡng (cửa sổ ghép cặp, cooldown, độ dài xung barrier, sai số ký
+    # tự, ngưỡng OCR) nay nằm ở từng dòng ParkingLot — xem models/parking_lot
+    # .py. Cache của parking_lot_service đã có sẵn trong RAM nên đọc chúng
+    # trên đường nóng không phát sinh truy vấn DB nào.
 
     def __init__(self):
         # Bounded: every detection enqueues here, so a stalled consumer (slow
         # DB / BLE endpoint) must shed load instead of growing without limit.
-        # Entries older than TIME_EXPIRED are useless for correlation anyway.
+        # Entries past their expiry are useless for correlation anyway.
         self.task_queue = Queue(maxsize=256)
+        # Ba dict dưới đây DÙNG CHUNG cho mọi bãi, trong khi mỗi bãi có cửa sổ
+        # riêng — nên hạn được tính sẵn lúc chèn và lưu ngay trong entry
+        # ("expire_at"). Vòng quét không cần biết entry thuộc bãi nào, chỉ so
+        # với now. Nếu quét bằng một hằng số chung thì bãi có cửa sổ ngắn sẽ
+        # giữ entry quá lâu và ngược lại.
         self.faces = {}
         self.plates = {}
-        # f"{plate_number}_{plate_camera_id}" -> ts của lần valid_success gần
-        # nhất. Tách khỏi self.plates vì entry trong self.plates có thể hết
-        # hạn rồi được tạo lại NGAY trong cùng một lượt xe — cờ matched gắn
-        # trên entry sẽ mất theo, còn dict này thì sống hết cooldown.
+        # f"{plate_number}_{plate_camera_id}" -> thời điểm HẾT HẠN cooldown.
+        # Tách khỏi self.plates vì entry trong self.plates có thể hết hạn rồi
+        # được tạo lại NGAY trong cùng một lượt xe — cờ matched gắn trên entry
+        # sẽ mất theo, còn dict này thì sống hết cooldown.
         self.matches = {}
         # Strong refs to in-flight fire-and-forget BLE notifications so the
         # event loop doesn't garbage-collect them mid-request.
@@ -56,13 +60,14 @@ class TaskParkingLot:
 
     async def valid_success(self, lot, identity_id, plate_number, face_jpeg, plate_jpeg):
         lot_id = lot["id"] if lot else None
+        duration = float(lot["barrier_duration"])
         print(f"Valid success for parking lot {lot_id} (identity {identity_id}, plate {plate_number})")
         # Mở barrier TRƯỚC — đây là thứ người ở cổng đang chờ. Trước kia nó
         # đứng CUỐI, sau 2 lần ghi ảnh + 1 lần ghi DB: bình thường chỉ tốn
         # vài chục ms, nhưng khi DB chậm/rớt thì barrier phải đợi hết timeout
         # của asyncpg. (open_door tự tách thread cho xung GPIO nên lệnh này
         # trả về ngay.)
-        await asyncio.to_thread(self._open_barrier, lot_id)
+        await asyncio.to_thread(self._open_barrier, lot_id, duration)
         # Lưu ảnh + ghi DB chạy NỀN để worker quay lại ghép cặp ngay lập tức
         # — DB nghẽn không giữ chân barrier của xe kế tiếp / làn khác nữa.
         bg = asyncio.create_task(
@@ -103,9 +108,9 @@ class TaskParkingLot:
             print(f"parking image save error: {e}")
             return None
 
-    def _open_barrier(self, lot_id):
+    def _open_barrier(self, lot_id, duration):
         try:
-            door_manager.open_door(0.5)
+            door_manager.open_door(duration)
             # response.raise_for_status()
             print(f"Barrier opened for parking lot {lot_id}")
         except Exception as e:
@@ -191,29 +196,26 @@ class TaskParkingLot:
         finally:
             await engine.dispose()
 
-    def _claim_match(self, plate_key, now):
+    def _claim_match(self, plate_key, now, cooldown):
         """True nếu biển này (ở làn này) CHƯA tạo sự kiện trong cooldown —
         đồng thời ghi nhận luôn. False = lượt xe này đã có sự kiện rồi
         (ví dụ người thứ 2 ngồi cùng xe) -> bỏ qua, không tạo dòng mới."""
-        if now - self.matches.get(plate_key, 0) < self.MATCH_COOLDOWN:
+        if now < self.matches.get(plate_key, 0):
             return False
-        self.matches[plate_key] = now
+        self.matches[plate_key] = now + cooldown
         return True
 
     async def _handle(self, task):
-        # Drop entries older than the correlation window.
+        # Drop entries past the expiry stamped on them when they were added.
         now = time.time()
         self.faces = {
-            k: v for k, v in self.faces.items()
-            if now - v["timestamp"] < self.TIME_EXPIRED
+            k: v for k, v in self.faces.items() if now < v["expire_at"]
         }
         self.plates = {
-            k: v for k, v in self.plates.items()
-            if now - v["timestamp"] < self.TIME_EXPIRED
+            k: v for k, v in self.plates.items() if now < v["expire_at"]
         }
         self.matches = {
-            k: v for k, v in self.matches.items()
-            if now - v < self.MATCH_COOLDOWN
+            k: expire_at for k, expire_at in self.matches.items() if now < expire_at
         }
 
         name_task = task.get("task")
@@ -224,32 +226,38 @@ class TaskParkingLot:
             full_jpeg = task.get("full_jpeg")
             key = f"{identity_id}_{camera_id}"
             _camera_plate = parking_lot_service.get_plate_camera(camera_id)
+            lot = parking_lot_service.get_by_camera_id(camera_id)
 
-            if not _camera_plate:
+            # lot lấy sớm hơn trước (cũ chỉ lấy sau nhánh làm mới) vì cửa sổ
+            # và cooldown giờ đọc từ chính nó.
+            if not _camera_plate or lot is None:
                 return
+
+            window = lot["time_expired"]
+            cooldown = lot["match_cooldown"]
 
             if key in self.faces:
                 # Sliding window: a continuously-detected face keeps its entry
-                # alive (and its snapshot fresh) instead of expiring 20s after
-                # the FIRST sighting. The partner plate branch handles the
-                # actual correlation when the plate arrives.
+                # alive (and its snapshot fresh) instead of expiring `window`
+                # seconds after the FIRST sighting. The partner plate branch
+                # handles the actual correlation when the plate arrives.
                 self.faces[key]["timestamp"] = timestamp
+                self.faces[key]["expire_at"] = now + window
                 self.faces[key]["full_jpeg"] = full_jpeg
                 # Người vẫn đứng ở làn -> trượt luôn cửa sổ chống trùng của
-                # các biển liên quan, phòng ca camera biển bị che >20s rồi
+                # các biển liên quan, phòng ca camera biển bị che quá lâu rồi
                 # đọc lại biển trong cùng lượt xe.
                 for _plate_number in identity_plate_service.get_by_identity_id(identity_id):
                     _pk = f"{_plate_number}_{_camera_plate}"
                     if _pk in self.matches:
-                        self.matches[_pk] = now
+                        self.matches[_pk] = now + cooldown
                 return
 
-            lot = parking_lot_service.get_by_camera_id(camera_id)
             _plates = identity_plate_service.get_by_identity_id(identity_id)
             for plate_number in _plates:
                 plate_key = f"{plate_number}_{_camera_plate}"
                 if plate_key in self.plates:
-                    if self._claim_match(plate_key, now):
+                    if self._claim_match(plate_key, now, cooldown):
                         await self.valid_success(
                             lot, identity_id, plate_number,
                             full_jpeg, self.plates[plate_key].get("full_jpeg"),
@@ -265,22 +273,41 @@ class TaskParkingLot:
             print(f"Registering face {identity_id} from camera {camera_id}")
             self.faces[key] = {
                 "timestamp": timestamp,
+                "expire_at": now + window,
                 "camera_id": camera_id,
                 "full_jpeg": full_jpeg,
             }
 
         elif name_task == "plate_recognition":
-            plate = task.get("plate")
             timestamp = task.get("timestamp")
             camera_id = task.get("camera_id")
             full_jpeg = task.get("full_jpeg")
             _camera_face = parking_lot_service.get_face_camera(camera_id)
+            lot = parking_lot_service.get_by_camera_id(camera_id)
+
+            if not _camera_face or lot is None:
+                return
+
+            window = lot["time_expired"]
+            cooldown = lot["match_cooldown"]
+
+            # Bãi xe TỰ đọc lại biển từ các OCR children bằng ocr_confidence
+            # của chính nó, không dùng lại chuỗi mà plate_recognition_service
+            # đã dựng bằng secondaryConf của AI job — siết ngưỡng cho barrier
+            # không kéo theo thay đổi dữ liệu EventPlate, và ngược lại.
+            plate = detect_plate_from_children(
+                task.get("children") or [], lot["ocr_confidence"],
+            )
+            if not plate:
+                return
+
             # Fuzzy match so a 1-2 char OCR slip still maps to the right
             # registered plate instead of dropping the event. The same plate can
             # belong to several people, so this returns every matching identity.
-            _candidates = identity_plate_service.get_by_plate_fuzzy(plate)
-
-            if not _camera_face or not _candidates:
+            _candidates = identity_plate_service.get_by_plate_fuzzy(
+                plate, lot["max_edit_distance"],
+            )
+            if not _candidates:
                 return
 
             # All candidates share the same normalised plate number (alnum,
@@ -290,20 +317,23 @@ class TaskParkingLot:
             key = f"{plate_number}_{camera_id}"
 
             if key in self.plates:
-                # Sliding window: refresh instead of expiring 20s after the
-                # first read. Skip the duplicate work (BLE + barrier) below.
+                # Sliding window: refresh instead of expiring `window` seconds
+                # after the first read. Skip the duplicate work (BLE + barrier)
+                # below.
                 self.plates[key]["timestamp"] = timestamp
+                self.plates[key]["expire_at"] = now + window
                 self.plates[key]["full_jpeg"] = full_jpeg
                 # Xe còn đứng ở làn (biển vẫn đang được đọc) -> trượt luôn
                 # cửa sổ chống trùng, để mặt người thứ 2 nhận diện muộn vẫn
                 # không tạo thêm sự kiện cho cùng lượt xe.
                 if key in self.matches:
-                    self.matches[key] = now
+                    self.matches[key] = now + cooldown
                 return
 
             # Notify the BLE service for every co-owner of the plate, but
             # fire-and-forget: a slow/blocking call here would stall the single
-            # worker loop and could push later events past the 20s window.
+            # worker loop and could push later events past the correlation
+            # window.
             for _data in _candidates:
                 _mac = _data.get("mac_bluetooth")
                 if _mac and settings.BLE_DETECT_URL:
@@ -315,7 +345,6 @@ class TaskParkingLot:
                     self._bg_tasks.add(bg)
                     bg.add_done_callback(self._bg_tasks.discard)
 
-            lot = parking_lot_service.get_by_camera_id(camera_id)
             # Open the barrier for whichever co-owner of the plate has a recent
             # matching face — stop at the first hit. _claim_match chặn lượt xe
             # đã có sự kiện (entry biển hết hạn rồi được đọc lại trong cùng
@@ -324,7 +353,7 @@ class TaskParkingLot:
                 _identity_id = _data["identity_id"]
                 _face_key = f"{_identity_id}_{_camera_face}"
                 if _face_key in self.faces:
-                    if self._claim_match(key, now):
+                    if self._claim_match(key, now, cooldown):
                         print(
                             f"[parking_lot] match identity={_identity_id} "
                             f"plate={plate_number} "
@@ -343,6 +372,7 @@ class TaskParkingLot:
             print(f"Registering plate {plate_number} from camera {camera_id}")
             self.plates[key] = {
                 "timestamp": timestamp,
+                "expire_at": now + window,
                 "camera_id": camera_id,
                 "full_jpeg": full_jpeg,
             }
@@ -350,7 +380,7 @@ class TaskParkingLot:
     def add_task(self, task):
         # Never block the AI recv loop: when the queue is full, drop the
         # oldest entry — it is the least likely to still fall inside the
-        # TIME_EXPIRED correlation window.
+        # correlation window.
         while True:
             try:
                 self.task_queue.put_nowait(task)

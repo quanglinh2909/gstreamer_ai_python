@@ -19,3 +19,6 @@ class FaceMaskDTO(BaseModel):
     # Re-alert interval in seconds while the same person stays in the zone.
     # 0 disables re-alerting (fire once per presence).
     re_alert_seconds: Optional[int] = 0
+    # Độ dài xung mở barrier (giây) khi phát hiện người KHÔNG đeo khẩu trang.
+    # Tuỳ phần cứng từng cổng; trước fix cứng 0.5 trong face_mask_service.
+    barrier_duration: Optional[float] = 0.5

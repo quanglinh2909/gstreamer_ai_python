@@ -19,10 +19,11 @@ from app.app import api_router
 from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.milvus import close_client, get_client
 from app.repositories.face_vector_repository import FaceVectorRepository
-from app.models import ai_config, event_face, event_plate, identity, identity_plate, parking_lot, parking_lot_event, plate_white_list, restricted_areas, system_metrics  # noqa: F401 - đăng ký model vào Base.metadata
+from app.models import ai_config, event_face, event_plate, identity, identity_plate, parking_lot, parking_lot_event, plate_white_list, plate_white_list_settings, restricted_areas, system_metrics  # noqa: F401 - đăng ký model vào Base.metadata
 from app.services.identity_plate_service import identity_plate_service
 from app.services.parking_lot_service import parking_lot_service
 from app.services.plate_white_list_service import plate_white_list_service
+from app.services.plate_white_list_settings_service import plate_white_list_settings_service
 from app.tasks.task_parking_lot import task_parking_lot
 from app.tasks.task_system_metrics import task_system_metrics
 
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
     # starts so the very first detection can hit the in-memory map.
     async with AsyncSessionLocal() as db:
         await plate_white_list_service.load_all(db)
+        await plate_white_list_settings_service.load_all(db)
         await parking_lot_service.load_all(db)
         await identity_plate_service.load_all(db)
     get_client()

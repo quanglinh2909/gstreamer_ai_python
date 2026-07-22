@@ -9,6 +9,7 @@ from app.dto.pagination_dto import PageResponse
 from app.dto.parking_lot_dto import (
     ParkingLotCreate,
     ParkingLotResponse,
+    ParkingLotSettings,
     ParkingLotUpdate,
 )
 from app.services.parking_lot_service import parking_lot_service
@@ -18,6 +19,11 @@ prefix = "/parking-lots"
 tags = ["Parking Lot"]
 
 
+def _settings_of(payload: ParkingLotSettings) -> dict:
+    # Chỉ lấy phần ngưỡng, bỏ name / cặp camera — tránh payload ghi nhầm cột.
+    return payload.model_dump(include=set(ParkingLotSettings.model_fields))
+
+
 @router.post("", response_model=ParkingLotResponse, status_code=201)
 async def create_parking_lot(
     payload: ParkingLotCreate,
@@ -25,6 +31,7 @@ async def create_parking_lot(
 ):
     entry = await parking_lot_service.create(
         db, payload.face_camera_id, payload.plate_camera_id, payload.name,
+        _settings_of(payload),
     )
     return ParkingLotResponse.model_validate(entry)
 
@@ -37,6 +44,7 @@ async def update_parking_lot(
 ):
     entry = await parking_lot_service.update(
         db, entry_id, payload.face_camera_id, payload.plate_camera_id, payload.name,
+        _settings_of(payload),
     )
     return ParkingLotResponse.model_validate(entry)
 

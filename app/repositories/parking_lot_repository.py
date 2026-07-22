@@ -3,7 +3,15 @@ from typing import Optional
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.parking_lot import ParkingLot
+from app.models.parking_lot import PARKING_LOT_SETTING_FIELDS, ParkingLot
+
+
+def _apply_settings(entry: ParkingLot, settings: Optional[dict]) -> None:
+    # Bỏ qua khoá không nằm trong PARKING_LOT_SETTING_FIELDS để một payload lạ
+    # không ghi đè được id hay cặp camera.
+    for field in PARKING_LOT_SETTING_FIELDS:
+        if settings and field in settings and settings[field] is not None:
+            setattr(entry, field, settings[field])
 
 
 class ParkingLotRepository:
@@ -13,12 +21,14 @@ class ParkingLotRepository:
         face_camera_id: str,
         plate_camera_id: str,
         name: Optional[str] = None,
+        settings: Optional[dict] = None,
     ) -> ParkingLot:
         entry = ParkingLot(
             face_camera_id=face_camera_id,
             plate_camera_id=plate_camera_id,
             name=name,
         )
+        _apply_settings(entry, settings)
         db.add(entry)
         await db.commit()
         await db.refresh(entry)
@@ -31,10 +41,12 @@ class ParkingLotRepository:
         face_camera_id: str,
         plate_camera_id: str,
         name: Optional[str] = None,
+        settings: Optional[dict] = None,
     ) -> ParkingLot:
         entry.face_camera_id = face_camera_id
         entry.plate_camera_id = plate_camera_id
         entry.name = name
+        _apply_settings(entry, settings)
         await db.commit()
         await db.refresh(entry)
         return entry

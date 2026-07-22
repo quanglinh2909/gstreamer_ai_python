@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.parking_lot import ParkingLot
+from app.models.parking_lot import PARKING_LOT_SETTING_FIELDS, ParkingLot
 from app.repositories.parking_lot_repository import ParkingLotRepository
 
 
@@ -16,12 +16,17 @@ def _clean_name(name: Optional[str]) -> Optional[str]:
 
 
 def _to_dict(entry: ParkingLot) -> Dict:
-    return {
+    # TaskParkingLot đọc dict này trên đường nóng (mỗi detection), nên mọi
+    # ngưỡng phải nằm sẵn ở đây — không truy vấn DB trong vòng ghép cặp.
+    data = {
         "id": entry.id,
         "name": entry.name,
         "face_camera_id": entry.face_camera_id,
         "plate_camera_id": entry.plate_camera_id,
     }
+    for field in PARKING_LOT_SETTING_FIELDS:
+        data[field] = getattr(entry, field)
+    return data
 
 
 class ParkingLotService:
@@ -121,10 +126,11 @@ class ParkingLotService:
         face_camera_id: str,
         plate_camera_id: str,
         name: Optional[str] = None,
+        settings: Optional[Dict] = None,
     ) -> ParkingLot:
         await self._check_cameras_free(db, face_camera_id, plate_camera_id)
         entry = await ParkingLotRepository.create(
-            db, face_camera_id, plate_camera_id, _clean_name(name),
+            db, face_camera_id, plate_camera_id, _clean_name(name), settings,
         )
         self._cache_put(entry)
         return entry
@@ -142,13 +148,14 @@ class ParkingLotService:
         face_camera_id: str,
         plate_camera_id: str,
         name: Optional[str] = None,
+        settings: Optional[Dict] = None,
     ) -> ParkingLot:
         entry = await self.get(db, entry_id)
         await self._check_cameras_free(
             db, face_camera_id, plate_camera_id, exclude_id=entry.id,
         )
         entry = await ParkingLotRepository.update(
-            db, entry, face_camera_id, plate_camera_id, _clean_name(name),
+            db, entry, face_camera_id, plate_camera_id, _clean_name(name), settings,
         )
         self._cache_put(entry)
         return entry
