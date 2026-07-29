@@ -83,14 +83,40 @@ class AIServiceBase:
         plate recognition overrides it with the sanitised plate text."""
         return str(int(value))
 
+    @staticmethod
+    def _normalized_box(parent, width, height):
+        """bbox thô -> khung CHUẨN HOÁ [0,1] theo kích thước ảnh full, để
+        frontend vẽ box lên ảnh ở bất kỳ kích thước hiển thị nào. Trả None nếu
+        thiếu toạ độ hoặc ảnh suy biến."""
+        if not width or not height:
+            return None
+        try:
+            x1 = float(parent.get("x1", 0.0))
+            y1 = float(parent.get("y1", 0.0))
+            x2 = float(parent.get("x2", 0.0))
+            y2 = float(parent.get("y2", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        def c(v):
+            return max(0.0, min(1.0, v))
+
+        return {
+            "x1": c(x1 / width), "y1": c(y1 / height),
+            "x2": c(x2 / width), "y2": c(y2 / height),
+        }
+
     @classmethod
     def _save_images_blocking(cls, full_jpeg, meta, parent, stem_value):
-        """Write the full frame and its crop; return (full_url, crop_url).
+        """Write the full frame and its crop; return (full_url, crop_url, box).
 
-        Returns None when there's nothing renderable (no bytes, undecodable
-        JPEG, degenerate crop, failed write) so callers can skip persisting
-        an event with dangling image paths. Blocking on purpose — callers
-        run it through `asyncio.to_thread`."""
+        `box` is the detection bbox normalised to [0,1] over the full frame
+        (or None). Returns None when there's nothing renderable (no bytes,
+        undecodable JPEG, degenerate crop, failed write) so callers can skip
+        persisting an event with dangling image paths. Blocking on purpose —
+        callers run it through `asyncio.to_thread`."""
         if not full_jpeg:
             return None
         img = cv2.imdecode(np.frombuffer(full_jpeg, np.uint8), cv2.IMREAD_COLOR)
@@ -104,6 +130,9 @@ class AIServiceBase:
         )
         if crop is None:
             return None
+
+        h, w = img.shape[:2]
+        box = cls._normalized_box(parent, w, h)
 
         date = datetime.date.today().isoformat()
         folder_rel = os.path.join(cls.EVENT_FOLDER, str(meta["cameraId"]), date)
@@ -121,4 +150,5 @@ class AIServiceBase:
         return (
             f"/uploads/{folder_rel}/{stem}_full.jpg",
             f"/uploads/{folder_rel}/{stem}_crop.jpg",
+            box,
         )

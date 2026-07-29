@@ -68,6 +68,16 @@ class ParkingLot(Base):
         nullable=False, server_default=text("0.3")
     )
 
+    # Độ chính xác khuôn mặt: điểm cosine tối thiểu để một khuôn mặt được coi
+    # là KHỚP cư dân rồi mới đẩy sang luồng ghép cặp bãi xe (mở barrier). Đây
+    # là ngưỡng RIÊNG cho nhánh bãi xe — trước đây fix cứng 0.15 trong
+    # face_recognition_service. Cao hơn = ít nhận nhầm người lạ thành cư dân
+    # (an toàn hơn) nhưng dễ bỏ sót; thấp hơn thì ngược lại. Không đụng tới
+    # ngưỡng lưu sự kiện khuôn mặt thường (secondaryConf của AI job).
+    face_confidence: Mapped[float] = mapped_column(
+        nullable=False, server_default=text("0.15")
+    )
+
 
 # Các cột cấu hình (tách khỏi name / cặp camera) — dùng chung cho DTO,
 # repository và cache để thêm cột mới chỉ phải sửa một chỗ.
@@ -77,4 +87,5 @@ PARKING_LOT_SETTING_FIELDS = (
     "barrier_duration",
     "max_edit_distance",
     "ocr_confidence",
+    "face_confidence",
 )

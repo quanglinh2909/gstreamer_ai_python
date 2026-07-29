@@ -26,5 +26,7 @@ class PlateRecognitionDTO(BaseModel):
     # nay nằm trong bảng plate_white_list_settings theo từng camera, cấu hình
     # qua API /plate-white-list-settings/{camera_id}. Client cũ vẫn gửi kèm
     # pre_time thì pydantic bỏ qua, không lỗi.
-
-
+    # Lưu khung phát hiện xuống DB để XEM LẠI vẽ được box/pose và tìm
+    # sự kiện theo vùng vẽ trên hình. MẶC ĐỊNH TẮT: bật lên là ghi liên
+    # tục mỗi khung hình, chỉ nên bật cho camera thực sự cần tra cứu lại.
+    saveDetections: Optional[bool] = False

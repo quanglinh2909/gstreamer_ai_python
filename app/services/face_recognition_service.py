@@ -22,6 +22,7 @@ from app.services.ai_job_service import AIJobSpec, ai_job_service
 # UPLOADS_ROOT is re-exported here: identity_service imports it from this
 # module, and it now lives with the shared crop/save helpers.
 from app.services.ai_service_base import UPLOADS_ROOT, AIServiceBase
+from app.services.parking_lot_service import parking_lot_service
 from app.tasks.task_parking_lot import task_parking_lot
 from app.ws.face_event_ws import face_event_broadcaster
 
@@ -44,18 +45,57 @@ FACE_SPEC = AIJobSpec(
 class FaceRecognitionService(AIServiceBase):
     EVENT_FOLDER = "faces"
 
-    # (cameraId, tracker_id) -> timestamp of the last EventFace written for
-    # that tracker. _track_state already prevents duplicate rows while a
-    # tracker stays continuously in the zone; this guards the exit/re-enter
-    # case (brief occlusion) where _track_state is cleared but the tracker
-    # keeps its id, which would otherwise write a second row.
-    _REENTER_COOLDOWN_S = 15
+    # MỘT SỰ KIỆN CHO MỘT TRACK — mất track là coi như người đó đi.
+    #
+    # Điểm chốt phải là ĐỜI CỦA TRACKER ID, KHÔNG phải nhịp entered/exited
+    # zone. Hai thứ đó không đi cùng nhau: đo trên camera "test", tracker giữ
+    # nguyên `id=0` suốt mấy phút liền trong khi vùng bắn ra/vào 28/22 lần và
+    # đẻ ra 65 sự kiện. Lý do là khung hình nào model không bắt được mặt thì id
+    # biến mất khỏi danh sách "đang trong vùng"; đủ `exit_grace` khung (chỉ 2
+    # giây với bytetrack ở fps 5) là `exited_zone` bắn, xoá trạng thái, rồi
+    # khung sau mặt hiện lại -> `entered_zone` -> thêm một sự kiện nữa, dù
+    # tracker chưa hề đánh mất người đó. Chính chú thích trong
+    # `ProcessAiHepper.lost_buffer_frames` đã cảnh báo đúng ca này.
+    #
+    # Nên: nhớ theo `(cameraId, tracker_id)` và KHÔNG xoá khi rời vùng. Chỉ
+    # quên khi id đó im lặng quá _TRACK_TTL_S — lúc ấy tracker chắc chắn đã
+    # bỏ nó (bộ đệm của tracker chỉ ~2-3 giây), id sau là người mới thật.
+    _TRACK_TTL_S = 10
 
     def __init__(self):
         # (cameraId, tracker_id) -> one of _MATCHING / _PENDING / _RESOLVED.
         # Survives across frames of the same tracker; cleared on exited_zone.
         self._track_state: dict = {}
-        self._last_saved: dict = {}
+        # (cameraId, tracker_id) -> lần cuối thấy id này (còn sống hay không).
+        self._track_seen: dict = {}
+        # Những track đã ghi sự kiện rồi.
+        self._written_tracks: set = set()
+        self._last_prune = 0.0
+
+    def _touch_track(self, camera_id, tid, now: float) -> None:
+        """Đánh dấu tracker id còn sống, và quên hẳn những id đã chết."""
+        key = (str(camera_id), int(tid))
+        last = self._track_seen.get(key)
+        # Xét CHÍNH id này trước, đừng chờ đợt dọn định kỳ: id im lặng quá lâu
+        # nghĩa là tracker đã bỏ nó và vừa cấp lại cho lần xuất hiện khác, nên
+        # phải quên sạch rồi mới đóng dấu. Làm ngược lại là tự cứu sống nó.
+        if last is not None and now - last > self._TRACK_TTL_S:
+            self._forget_track(key)
+        self._track_seen[key] = now
+
+        # Đợt dọn định kỳ chỉ để bảng khỏi phình với những id không bao giờ
+        # quay lại.
+        if now - self._last_prune < self._TRACK_TTL_S:
+            return
+        self._last_prune = now
+        for k in [k for k, t in self._track_seen.items()
+                  if now - t > self._TRACK_TTL_S]:
+            self._track_seen.pop(k, None)
+            self._forget_track(k)
+
+    def _forget_track(self, key) -> None:
+        self._written_tracks.discard(key)
+        self._track_state.pop(key, None)
 
     async def face_recognition(self, db: AsyncSession, req: FaceRecognitionDTO):
         return await ai_job_service.upsert(db, req, FACE_SPEC)
@@ -174,7 +214,7 @@ class FaceRecognitionService(AIServiceBase):
             identity_id,
             det_for_crop,
         )
-        full_url, crop_url = (paths if paths is not None else (None, None))
+        full_url, crop_url, _box = (paths if paths is not None else (None, None, None))
 
         return FaceInfo(
             id=milvus_id,
@@ -282,7 +322,15 @@ class FaceRecognitionService(AIServiceBase):
         similarity = 0.0
         embedding = self._extract_embedding(parent)
         if embedding:
-            _identity_id, _similarity = await self._match_identity(embedding, 0.15)
+            # Ngưỡng "độ chính xác khuôn mặt" của CHÍNH cổng này (bãi xe), chọn
+            # từ giao diện; camera không thuộc bãi nào thì giữ mặc định 0.15.
+            lot = parking_lot_service.get_by_camera_id(meta["cameraId"])
+            face_conf = (
+                float(lot["face_confidence"])
+                if lot and lot.get("face_confidence") is not None
+                else 0.15
+            )
+            _identity_id, _similarity = await self._match_identity(embedding, face_conf)
             if _identity_id is not None:
                 task_parking_lot.add_task({
                     "task": "face_recognition",
@@ -298,21 +346,18 @@ class FaceRecognitionService(AIServiceBase):
         if identity_id is None and not save_unmatched:
             return None
 
-        # Already identified on a previous frame: keep returning the match so
-        # the tracker stays RESOLVED, but don't write another EventFace row.
+        # Track này đã ghi sự kiện rồi: vẫn trả kết quả khớp để nó ở nguyên
+        # trạng thái RESOLVED, nhưng không ghi thêm dòng nào nữa.
         if not persist:
             return identity_id
 
         if not identity_id:
             return None
 
-        # Exit/re-enter dedup: the same tracker may briefly leave the zone
-        # (occlusion) which clears _track_state, then re-enter under the same
-        # id. Skip writing another row if we saved one for this tracker very
-        # recently — but still return the match so it stays RESOLVED.
-        key = (str(meta["cameraId"]), int(tid))
-        last = self._last_saved.get(key)
-        if last is not None and timestamp - last < self._REENTER_COOLDOWN_S:
+        # Track này đã có sự kiện rồi. Đây mới là chốt chặn thật: nó SỐNG SÓT
+        # qua nhịp exited/entered zone, thứ mà `_track_state` thì không.
+        write_key = (str(meta["cameraId"]), int(tid))
+        if write_key in self._written_tracks:
             return identity_id
 
         try:
@@ -320,8 +365,11 @@ class FaceRecognitionService(AIServiceBase):
                 self._save_images_blocking, full_jpeg, meta, parent, tid,
             )
             if paths is None:
-                return identity_id
-            full_url, crop_url = paths
+                # Ghi ảnh hỏng -> trả None để track ở lại PENDING và khung sau
+                # thử lại. Trả identity_id ở đây là track thành RESOLVED và
+                # lần xuất hiện này mất luôn cả sự kiện lẫn ảnh.
+                return None
+            full_url, crop_url, box = paths
 
             async with session_factory() as db:
                 event = EventFace(
@@ -331,10 +379,14 @@ class FaceRecognitionService(AIServiceBase):
                     timestamp=int(timestamp),
                     image_full=full_url,
                     image_crop=crop_url,
+                    box_x1=box["x1"] if box else None,
+                    box_y1=box["y1"] if box else None,
+                    box_x2=box["x2"] if box else None,
+                    box_y2=box["y2"] if box else None,
                 )
                 db.add(event)
                 await db.commit()
-                self._last_saved[key] = timestamp
+                self._written_tracks.add(write_key)
 
                 # Resolve the identity name in the same session so the
                 # broadcast carries everything a UI needs (id + label),
@@ -355,9 +407,12 @@ class FaceRecognitionService(AIServiceBase):
                 "timestamp": int(event.timestamp),
                 "image_full": event.image_full,
                 "image_crop": event.image_crop,
+                "box": box,
             })
         except Exception as exc:
             print(f"face persist error: {exc}", file=sys.stderr)
+            # Như trên: hỏng thì để track thử lại chứ đừng khoá nó là xong.
+            return None
         return identity_id
 
     async def _run_match(
@@ -383,6 +438,7 @@ class FaceRecognitionService(AIServiceBase):
             raise
 
     def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
+        self._touch_track(meta["cameraId"], id, timestamp)
         parent = self._find_parent(meta, id)
         if parent is None:
             return
@@ -397,6 +453,7 @@ class FaceRecognitionService(AIServiceBase):
         )
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
+        self._touch_track(meta["cameraId"], id, timestamp)
         key = (str(meta["cameraId"]), int(id))
         # Keep re-identifying every frame, but skip while a match is already in
         # flight to avoid spawning overlapping tasks. RESOLVED keeps running —
@@ -420,12 +477,11 @@ class FaceRecognitionService(AIServiceBase):
         print(f"stayed_zone")
 
     def exited_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
-        self._track_state.pop((str(meta["cameraId"]), int(id)), None)
-        # Keep recent save stamps for the re-enter cooldown; drop aged-out
-        # ones so the map can't grow without bound.
-        cutoff = timestamp - self._REENTER_COOLDOWN_S
-        self._last_saved = {k: t for k, t in self._last_saved.items() if t >= cutoff}
-        print(f"Face exited_zone")
+        # CỐ Ý không xoá gì ở đây. Vùng bắn "đã ra" chỉ vì vài khung hình
+        # không bắt được mặt, trong khi tracker vẫn giữ nguyên id — xoá ở đây
+        # là khung sau vào lại và đẻ thêm một sự kiện trùng. Việc quên một
+        # track do `_touch_track` lo, dựa trên id đó im lặng bao lâu.
+        print(f"Face exited_zone id={id}")
 
 
 face_recognition_service = FaceRecognitionService()

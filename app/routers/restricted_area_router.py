@@ -22,6 +22,16 @@ async def restricted_area(
     return await restricted_area_service.restricted_area(db, req)
 
 
+@router.get("/settings")
+async def restricted_area_settings(
+    cameraId: str = Query(..., description="Camera cần xem cấu hình model/lớp."),
+    db: AsyncSession = Depends(get_db),
+):
+    """Model + class filter đang áp cho camera (kèm giá trị mặc định) — giao
+    diện dùng để hiển thị đúng lựa chọn hiện tại."""
+    return await restricted_area_service.get_settings(db, cameraId)
+
+
 @router.post("/test")
 async def restricted_area_test(
     image: UploadFile = File(...),

@@ -19,12 +19,13 @@ from app.app import api_router
 from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.milvus import close_client, get_client
 from app.repositories.face_vector_repository import FaceVectorRepository
-from app.models import ai_config, event_face, event_plate, identity, identity_plate, parking_lot, parking_lot_event, plate_white_list, plate_white_list_settings, restricted_areas, system_metrics  # noqa: F401 - đăng ký model vào Base.metadata
+from app.models import ai_config, detection_slice, event_face, event_plate, identity, identity_plate, parking_lot, parking_lot_event, plate_white_list, plate_white_list_settings, restricted_areas, storage_policy, system_metrics  # noqa: F401 - đăng ký model vào Base.metadata
 from app.services.identity_plate_service import identity_plate_service
 from app.services.parking_lot_service import parking_lot_service
 from app.services.plate_white_list_service import plate_white_list_service
 from app.services.plate_white_list_settings_service import plate_white_list_settings_service
 from app.tasks.task_parking_lot import task_parking_lot
+from app.tasks.task_storage_cleanup import task_storage_cleanup
 from app.tasks.task_system_metrics import task_system_metrics
 
 UPLOADS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
@@ -35,6 +36,17 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Seed hàng cấu hình dọn-dung-lượng mặc định (bảng một-hàng, id=1).
+        await conn.exec_driver_sql(
+            "INSERT INTO storage_policy (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
+        )
+        # create_all KHÔNG thêm cột vào bảng đã tồn tại. Cột cấu hình mới phải
+        # tự ALTER (idempotent) để bãi đang chạy nhận được mà không mất dữ liệu.
+        await conn.exec_driver_sql(
+            "ALTER TABLE parking_lot "
+            "ADD COLUMN IF NOT EXISTS face_confidence DOUBLE PRECISION "
+            "NOT NULL DEFAULT 0.15"
+        )
     # Prime the plate whitelist cache before the ALPR consumer thread
     # starts so the very first detection can hit the in-memory map.
     async with AsyncSessionLocal() as db:
@@ -51,10 +63,13 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=task_parking_lot.worker, daemon=True).start()
     # Samples CPU/temp/memory/load/NPU/RGA every 10s into rolling 1-month tables.
     threading.Thread(target=task_system_metrics.worker, daemon=True).start()
+    # Tự dọn dung lượng: giữ tối thiểu N GB trống, xoá dữ liệu cũ khi cần.
+    threading.Thread(target=task_storage_cleanup.worker, daemon=True).start()
     threading.Thread(target=play_sound.play_sound, daemon=True).start()
     yield
     process_ai_service.stop()
     task_system_metrics.stop()
+    task_storage_cleanup.stop()
     close_client()
 
 

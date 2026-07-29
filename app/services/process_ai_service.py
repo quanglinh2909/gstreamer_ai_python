@@ -17,6 +17,18 @@ from sqlalchemy.ext.asyncio import (
 from app.core.config import settings
 from app.repositories.ai_config_repository import AIRepository
 from app.utils.process_ai_hepper import ProcessAiHepper
+from app.ws.live_detection_ws import live_detection_broadcaster
+from app.services.detection_slice_writer import detection_slice_writer
+
+# Trần số khung phát hiện gửi kèm một khung hình. Cảnh đông người mà gửi hết
+# thì gói phình ra vô ích — nhìn trên màn hình cũng chỉ là một rừng khung.
+MAX_LIVE_BOXES = 50
+
+# VÙNG (polygon) là dữ liệu TĨNH của cấu hình, gửi kèm mỗi khung hình thì gần
+# như gấp đôi gói mà chẳng thêm thông tin gì. Gửi lại mỗi ngần này giây thôi;
+# client giữ vùng đã nhận và chỉ cập nhật khi có khoá `zones` mới. Người mới mở
+# xem chờ tối đa ngần này là thấy vùng.
+ZONE_RESEND_SEC = 1.0
 
 
 class ProcessAiService:
@@ -37,9 +49,19 @@ class ProcessAiService:
         # single O(1) `key in dict` check (atomic in CPython) — no copy,
         # no JPEG decode, no locking. Only when at least one MJPEG client
         # is connected do we stash the latest meta+jpeg+polygons.
+        # Lần cuối gửi VÙNG cho mỗi (cam, job) — vùng là dữ liệu tĩnh nên chỉ
+        # gửi lại thưa (ZONE_RESEND_SEC) thay vì kèm mỗi khung hình.
+        self._zone_sent_at: dict = {}        # (cam, job) -> epoch giây
+        # Nhịp ghi detection_slice xuống DB (chạy nền, không chặn vòng nhận).
+        self._last_slice_flush = 0.0
         self._debug_lock = threading.Lock()
         self._debug_subscribers: dict = {}   # (cam, job) -> refcount
         self._debug_latest: dict = {}        # (cam, job) -> {meta, full_jpeg, seq, polygons, primary_conf}
+        # Ảnh JPEG đầy MỚI NHẤT theo camera. Engine giới hạn tần suất encode JPEG
+        # (encode phần mềm 1080p tốn CPU) nên có khung metadata KHÔNG kèm ảnh.
+        # Sự kiện rơi đúng khung đó vẫn cần ảnh -> lấy ảnh mới nhất (trễ tối đa
+        # ~vài trăm ms, thừa đủ cho ảnh sự kiện). camera_id -> bytes.
+        self._last_full_jpeg: dict = {}
         # Dedup the "AI config not found" warning: C++ engine workers that
         # never had a Python-side AIConfig (typically orphan jobs left
         # behind by the old duplicate-on-save bug) would otherwise spam
@@ -122,6 +144,128 @@ class ProcessAiService:
                 "class_meta": class_meta,
             }
 
+    @staticmethod
+    def _build_boxes(meta, class_meta, min_score=0.0):
+        """Khung phát hiện của một khung hình, CHUẨN HOÁ [0,1].
+
+        Tách riêng vì có HAI người dùng: đẩy websocket cho người xem trực tiếp,
+        và bộ ghi detection_slice. Dựng một lần rồi dùng chung — trước đây nằm
+        trong _publish_live_boxes nên bật ghi mà không ai xem thì không có gì.
+
+        Trả (boxes, width, height); width=0 nghĩa là khung không dùng được."""
+        # Engine C++ gửi `origWidth`/`origHeight` (xem ResultPublisher::
+        # buildJson) — KHÔNG phải `width`/`height`. Vẫn đọc cả hai tên
+        # phòng khi định dạng đổi.
+        width = float(meta.get("origWidth") or meta.get("width") or 0)
+        height = float(meta.get("origHeight") or meta.get("height") or 0)
+        if width <= 0 or height <= 0:
+            return [], 0.0, 0.0
+
+        def norm(value, size):
+            # Kẹp về [0,1]: bbox có thể lòi ra ngoài mép khung.
+            return round(min(1.0, max(0.0, float(value) / size)), 4)
+
+        boxes = []
+        for det in (meta.get("detections") or []):
+            if len(boxes) >= MAX_LIVE_BOXES:
+                break
+            score = float(det.get("score", 0.0))
+            if score < min_score:
+                continue
+            class_id = det.get("classId")
+            entry = (class_meta or {}).get(class_id) or {}
+            box = {
+                "x1": norm(det.get("x1", 0), width),
+                "y1": norm(det.get("y1", 0), height),
+                "x2": norm(det.get("x2", 0), width),
+                "y2": norm(det.get("y2", 0), height),
+                "score": round(score, 3),
+                "class_id": class_id,
+            }
+            # Nhãn/ id theo dõi chỉ gửi khi có, cho gói gọn.
+            name = entry.get("name")
+            if name:
+                box["label"] = name
+            tid = det.get("tracker_id")
+            if tid is not None and int(tid) >= 0:
+                box["tid"] = int(tid)
+
+            # POSE: engine gửi keypoints dạng bộ ba (x, y, score) PHẲNG,
+            # toạ độ full-res. Chuẩn hoá x/y như box; giữ nguyên dạng phẳng
+            # (gọn hơn mảng object ~3 lần) và bỏ điểm score<=0 bằng cách
+            # đặt score 0 — client tự bỏ qua.
+            kps = det.get("keypoints") or []
+            if kps:
+                flat = []
+                for k in range(0, len(kps) - 2, 3):
+                    flat.append(norm(kps[k], width))
+                    flat.append(norm(kps[k + 1], height))
+                    flat.append(round(float(kps[k + 2]), 2))
+                if flat:
+                    box["kps"] = flat
+
+            # MASK phân vùng: engine gửi lưới bit GxG dạng HEX phủ đúng bbox.
+            # Chuyển thẳng sang client, không dựng polygon ở đây — 256 ký tự
+            # rẻ hơn nhiều so với tìm biên rồi đơn giản hoá phía server.
+            mask_hex = det.get("mask")
+            if mask_hex:
+                box["mask"] = mask_hex
+                box["mask_grid"] = int(det.get("maskGrid") or 32)
+
+            boxes.append(box)
+
+        return boxes, width, height
+
+    def _publish_live_boxes(self, camera_id, job_id, ai_type, meta, boxes,
+                            width, height, polygons=None) -> None:
+        """Hot path. Đẩy khung phát hiện cho người đang xem TRỰC TIẾP.
+
+        Khác `_stash_debug_frame`: KHÔNG đòi có JPEG. Engine C++ chỉ mã hoá ảnh
+        khi khung có ít nhất một phát hiện, nên nếu bắt buộc có ảnh thì khung
+        "không thấy gì" sẽ bị bỏ qua và lớp phủ trên màn hình sẽ ĐỨNG YÊN mãi ở
+        khung cuối. Ở đây khung rỗng vẫn phải gửi để client xoá đi."""
+        if not live_detection_broadcaster.has_clients(camera_id):
+            return
+        try:
+            def norm(value, size):
+                return round(min(1.0, max(0.0, float(value) / size)), 4)
+
+            now = time.time()
+            payload = {
+                "camera_id": str(camera_id),
+                "job_id": str(job_id),
+                "ai_type": ai_type,
+                "seq": meta.get("seq", 0),
+                "ts": now,
+                "width": int(width),
+                "height": int(height),
+                "boxes": boxes,
+            }
+
+            # Vùng chỉ kèm theo mỗi ZONE_RESEND_SEC giây. KHÔNG có khoá `zones`
+            # nghĩa là "giữ nguyên vùng cũ"; có mà rỗng nghĩa là "không có
+            # vùng nào" (job chạy toàn khung) — hai chuyện khác nhau.
+            zkey = (str(camera_id), str(job_id))
+            if now - self._zone_sent_at.get(zkey, 0.0) >= ZONE_RESEND_SEC:
+                self._zone_sent_at[zkey] = now
+                zones = []
+                for poly in (polygons or []):
+                    # None = vùng ảo TOÀN KHUNG (không có polygon thật) — không
+                    # vẽ, vì vẽ ra chỉ là cái khung viền quanh cả màn hình.
+                    if poly is None:
+                        continue
+                    pts = [
+                        [norm(px, width), norm(py, height)]
+                        for px, py in poly.tolist()
+                    ]
+                    if len(pts) >= 3:
+                        zones.append(pts)
+                payload["zones"] = zones
+
+            live_detection_broadcaster.publish(payload)
+        except Exception as exc:  # không bao giờ để lớp phủ làm chết vòng nhận
+            print(f"live boxes publish skipped: {exc}", file=sys.stderr)
+
     def _drain_invalidations(self) -> None:
         with self._invalidate_lock:
             if not self._pending_invalidations:
@@ -199,6 +343,15 @@ class ProcessAiService:
             orig_width = meta.get("width")
             orig_height = meta.get("height")
 
+            # Engine hạ tần suất encode JPEG (xem AiJob::kDetJpegMinGapMs) nên
+            # nhiều khung tới KHÔNG kèm ảnh. Giữ ảnh đầy mới nhất theo camera và
+            # thay vào khi khung hiện tại rỗng, để sự kiện (entered_zone...) luôn
+            # có ảnh dù rơi đúng khung bị bỏ encode. Ảnh trễ ≤ ~kDetJpegMinGapMs.
+            if full_jpeg:
+                self._last_full_jpeg[camera_id] = full_jpeg
+            else:
+                full_jpeg = self._last_full_jpeg.get(camera_id) or full_jpeg
+
             # Pick up any API-driven config changes before deciding whether
             # the existing cached state is still valid.
             self._drain_invalidations()
@@ -256,6 +409,9 @@ class ProcessAiService:
                     "secondary_conf": ai_config.secondary_conf,
                     "primary_conf": ai_config.primary_conf,
                     "ai_type": ai_config.type,
+                    # Ghi khung phát hiện xuống DB để xem lại / tìm theo
+                    # vùng. Mặc định TẮT.
+                    "save_detections": bool(getattr(ai_config, "save_detections", False)),
                     # Free-form per-config JSON forwarded to the service hooks.
                     # Falls back to {} for rows saved before the column existed.
                     "extra_data": ai_config.extra_data if ai_config.extra_data is not None else {},
@@ -276,6 +432,7 @@ class ProcessAiService:
                 secondary_conf = state["secondary_conf"]
                 primary_conf = state.get("primary_conf", 0.3)
                 ai_type = state.get("ai_type")
+                save_detections = state.get("save_detections", False)
                 track_class_ids = state.get("track_class_ids")
                 class_meta = state.get("class_meta")
                 extra_data = state.get("extra_data") or {}
@@ -333,6 +490,35 @@ class ProcessAiService:
                     # MJPEG overlay can show them.
                     self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons,
                                             primary_conf, overlap_threshold, class_meta)
+
+                # Khung phát hiện dùng cho HAI việc: lớp phủ trực tiếp và ghi
+                # xuống DB để xem lại. Đặt SAU cả hai nhánh trên (và ngoài
+                # chúng) để MỌI khung đều được xử lý — kể cả khung không phát
+                # hiện gì, vốn là tín hiệu để client xoá khung cũ. Lọc theo
+                # `primary_conf` nên khung vẽ ra đúng bằng khung hệ thống thực
+                # sự theo dõi.
+                #
+                # Dựng box CHỈ KHI có người cần: không ai xem live mà cũng
+                # không bật ghi thì bỏ qua hẳn (đây là mỗi khung của mọi camera).
+                if save_detections or live_detection_broadcaster.has_clients(camera_id):
+                    live_boxes, lw, lh = self._build_boxes(meta, class_meta, primary_conf)
+                    if lw > 0:
+                        self._publish_live_boxes(camera_id, job_id, ai_type, meta,
+                                                 live_boxes, lw, lh, polygons)
+                        if save_detections:
+                            detection_slice_writer.add_frame(
+                                camera_id, job_id, ai_type, live_boxes,
+                            )
+
+                # Ghi các lát đã chốt xuống DB theo MẺ, chạy nền: một cú ghi DB
+                # chậm không được phép làm nghẽn luồng xử lý ảnh.
+                if save_detections:
+                    now_s = time.time()
+                    if now_s - self._last_slice_flush >= 2.0:
+                        self._last_slice_flush = now_s
+                        asyncio.create_task(
+                            detection_slice_writer.flush(self._session_factory)
+                        )
 
                 now = time.time()
                 for zone_idx, polygon in enumerate(polygons):

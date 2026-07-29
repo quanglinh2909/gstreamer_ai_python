@@ -18,3 +18,8 @@ class EventFace(Base):
     timestamp: Mapped[int] = mapped_column(nullable=False)
     image_full: Mapped[str] = mapped_column(String, nullable=True)
     image_crop: Mapped[str] = mapped_column(String, nullable=True)
+    # Khung phát hiện CHUẨN HOÁ [0,1] theo ảnh full (để vẽ box lên ảnh).
+    box_x1: Mapped[Optional[float]] = mapped_column(nullable=True)
+    box_y1: Mapped[Optional[float]] = mapped_column(nullable=True)
+    box_x2: Mapped[Optional[float]] = mapped_column(nullable=True)
+    box_y2: Mapped[Optional[float]] = mapped_column(nullable=True)

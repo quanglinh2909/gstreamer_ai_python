@@ -161,7 +161,7 @@ class PlateRecognitionService(AIServiceBase):
             )
             if paths is None:
                 return
-            full_url, crop_url = paths
+            full_url, crop_url, box = paths
             async with session_factory() as db:
                 event = EventPlate(
                     camera_id=str(meta["cameraId"]),
@@ -170,6 +170,10 @@ class PlateRecognitionService(AIServiceBase):
                     timestamp=int(timestamp),
                     image_full=full_url,
                     image_crop=crop_url,
+                    box_x1=box["x1"] if box else None,
+                    box_y1=box["y1"] if box else None,
+                    box_x2=box["x2"] if box else None,
+                    box_y2=box["y2"] if box else None,
                 )
                 db.add(event)
                 await db.commit()
@@ -187,6 +191,7 @@ class PlateRecognitionService(AIServiceBase):
                 "timestamp": int(event.timestamp),
                 "image_full": event.image_full,
                 "image_crop": event.image_crop,
+                "box": box,
             })
         except Exception as exc:
             print(f"plate persist error: {exc}", file=sys.stderr)

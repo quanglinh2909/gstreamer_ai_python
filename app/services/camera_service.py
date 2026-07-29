@@ -58,6 +58,9 @@ class CameraService:
             ai_job["dwellSeconds"] = matched.dwell_seconds or 0
             ai_job["maxFps"] = matched.fps
             ai_job["job_id"] = matched.job_id
+            # Cờ ghi khung phát hiện — engine C++ không biết trường này, chỉ
+            # có ở bảng cấu hình phía Python.
+            ai_job["saveDetections"] = bool(getattr(matched, "save_detections", False))
             ai_job["extra_data"] = matched.extra_data or {}
         else:
             # Fallback for jobs that exist in the C++ engine but never

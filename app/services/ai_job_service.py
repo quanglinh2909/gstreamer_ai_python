@@ -72,7 +72,8 @@ class AIJobService:
 
         if existing:
             ai_models = await HTTPXClient.get("/ai-models")
-            payload = req.model_dump(exclude_none=True, exclude={"polygons"})
+            payload = req.model_dump(exclude_none=True,
+                                     exclude={"polygons", "saveDetections"})
             payload["primaryConf"] = 0.2
             payload["secondaryConf"] = 0.2
             payload["modelPath"] = self._get_path(ai_models, spec.model_file_1)
@@ -85,7 +86,7 @@ class AIJobService:
             data = await HTTPXClient.put(f"/ai-jobs/{existing['id']}", json=payload)
         else:
             ai_models = await HTTPXClient.get("/ai-models")
-            payload = req.model_dump(exclude={"polygons"})
+            payload = req.model_dump(exclude={"polygons", "saveDetections"})
             payload["modelPath"] = self._get_path(ai_models, spec.model_file_1)
             payload["modelPath2"] = self._get_path(ai_models, spec.model_file_2)
             payload["modelType"] = spec.model_type_1
@@ -115,6 +116,8 @@ class AIJobService:
                 overlap_threshold=req.overlap_threshold,
                 dwell_seconds=req.dwellSeconds,
                 extra_data=extra_data,
+                # getattr: DTO cũ chưa khai báo trường này vẫn chạy được.
+                save_detections=bool(getattr(req, "saveDetections", False)),
             ),
         )
         # Force the recv loop to reload tracker/polygons/thresholds for this

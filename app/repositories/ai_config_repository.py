@@ -35,6 +35,7 @@ class AIRepository:
             ai_config.tracker = payload.tracker
             ai_config.overlap_threshold = payload.overlap_threshold
             ai_config.dwell_seconds = payload.dwell_seconds
+            ai_config.save_detections = bool(payload.save_detections)
             if payload.extra_data is not None:
                 ai_config.extra_data = payload.extra_data
         else:
@@ -49,6 +50,7 @@ class AIRepository:
                 tracker=payload.tracker,
                 overlap_threshold=payload.overlap_threshold,
                 dwell_seconds=payload.dwell_seconds,
+                save_detections=bool(payload.save_detections),
                 extra_data=payload.extra_data if payload.extra_data is not None else {},
             )
             db.add(ai_config)

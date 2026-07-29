@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from typing import Optional
+
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from app.ws.face_event_ws import face_event_broadcaster
 
@@ -11,7 +13,7 @@ tags = ["WebSocket"]
 
 
 @router.websocket("/face-events")
-async def face_events_ws(ws: WebSocket):
+async def face_events_ws(ws: WebSocket, camera_id: Optional[str] = Query(None)):
     """Streams one JSON message per persisted face event:
 
     {"id": int, "camera_id": str, "identity_id": int|null,
@@ -22,7 +24,7 @@ async def face_events_ws(ws: WebSocket):
     a UI can render WS pushes through the same component as paginated
     history. The server doesn't expect any input — incoming frames are
     drained only so a client disconnect propagates as WebSocketDisconnect."""
-    await face_event_broadcaster.connect(ws)
+    await face_event_broadcaster.connect(ws, camera_id)
     try:
         while True:
             await ws.receive_text()

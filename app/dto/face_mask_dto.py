@@ -22,3 +22,7 @@ class FaceMaskDTO(BaseModel):
     # Độ dài xung mở barrier (giây) khi phát hiện người KHÔNG đeo khẩu trang.
     # Tuỳ phần cứng từng cổng; trước fix cứng 0.5 trong face_mask_service.
     barrier_duration: Optional[float] = 0.5
+    # Lưu khung phát hiện xuống DB để XEM LẠI vẽ được box/pose và tìm
+    # sự kiện theo vùng vẽ trên hình. MẶC ĐỊNH TẮT: bật lên là ghi liên
+    # tục mỗi khung hình, chỉ nên bật cho camera thực sự cần tra cứu lại.
+    saveDetections: Optional[bool] = False

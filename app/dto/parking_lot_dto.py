@@ -31,6 +31,12 @@ class ParkingLotSettings(BaseModel):
         description="Ngưỡng tin cậy của từng ký tự OCR khi bãi đọc lại biển. "
                     "Ký tự yếu hơn bị loại khỏi chuỗi.",
     )
+    face_confidence: float = Field(
+        0.15, ge=0.0, le=1.0,
+        description="Độ chính xác khuôn mặt: điểm khớp tối thiểu để coi là cư "
+                    "dân rồi mở barrier. Cao hơn = ít nhận nhầm người lạ nhưng "
+                    "dễ bỏ sót.",
+    )
 
 
 class ParkingLotCreate(ParkingLotSettings):
@@ -57,3 +63,4 @@ class ParkingLotResponse(BaseModel):
     barrier_duration: float
     max_edit_distance: int
     ocr_confidence: float
+    face_confidence: float

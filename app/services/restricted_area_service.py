@@ -1,8 +1,15 @@
 import asyncio
+import os
 import sys
+from dataclasses import replace as dc_replace
 from typing import Optional
 
+import requests
+
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.ai_config import AIConfig
 
 from app.dto.restricted_area_dto import RestrictedAreaDTO
 from app.enum.config_ai_enum import TypeConfigAiEnum
@@ -49,6 +56,30 @@ RESTRICTED_AREA_SPEC = AIJobSpec(
 #     class_filter="1",
 # )
 
+# ─── Gọi điện thoại báo động (voip24h) ───────────────────────────────
+# Mỗi lần có người vào vùng cấm thì gọi API tổng hợp giọng nói của
+# voip24h để nó gọi tới số trực. Mọi tham số đọc từ biến môi trường để
+# đổi số/nội dung mà không phải sửa mã; giá trị mặc định là cấu hình
+# đang dùng.
+VOICE_ALERT_ENABLED = os.getenv("VOICE_ALERT_ENABLED", "1").lower() not in (
+    "0", "false", "no", "off",
+)
+VOICE_ALERT_URL = os.getenv(
+    "VOICE_ALERT_URL", "http://otp.voip24h.vn/api/voice_synthesis"
+)
+VOICE_ALERT_VOIP = os.getenv(
+    "VOICE_ALERT_VOIP", "71d9486620f9d9b025afcc29fef48c0edf26ad84"
+)
+VOICE_ALERT_PHONE = os.getenv("VOICE_ALERT_PHONE", "0355536733")
+VOICE_ALERT_TEXT = os.getenv("VOICE_ALERT_TEXT", "Có người vào khu vực cấm")
+VOICE_ALERT_LANGUAGE = os.getenv("VOICE_ALERT_LANGUAGE", "vi-Vn")
+# Cookie phiên trong ví dụ gốc. API xác thực bằng tham số `voip` nên
+# cookie này thường không cần; giữ lại vì đó là request đã chạy được.
+VOICE_ALERT_COOKIE = os.getenv("VOICE_ALERT_COOKIE", "PHPSESSID=66m5fvbq269hossuc4moscna71")
+# Quá hạn thì bỏ cuộc — đây là mạng ngoài, treo lâu sẽ giữ thread vô ích.
+VOICE_ALERT_TIMEOUT_S = float(os.getenv("VOICE_ALERT_TIMEOUT_S", "10"))
+
+
 class RestrictedAreaService(AIServiceBase):
     # YOLO class ids to run tracking / zone logic on. Read by
     # process_ai_service via ProcessAiHepper.get_track_class_ids.
@@ -66,11 +97,82 @@ class RestrictedAreaService(AIServiceBase):
     # produce a second row. This is the only dedup for restricted-area events.
     _REENTER_COOLDOWN_S = 15
 
+    # Khoảng nghỉ giữa hai CUỘC GỌI của cùng một camera. Tách khỏi
+    # _REENTER_COOLDOWN_S (vốn tính theo từng tracker): mười người cùng bước
+    # vào là mười lần entered_zone, không chặn ở đây thì thành mười cuộc gọi
+    # liên tiếp tới cùng một số. Sự kiện/ảnh vẫn được lưu đủ, chỉ cuộc gọi mới
+    # bị gộp.
+    _VOICE_CALL_COOLDOWN_S = float(os.getenv("VOICE_ALERT_COOLDOWN_S", "60"))
+
     def __init__(self):
         self._last_saved: dict = {}
+        # camera_id -> timestamp của cuộc gọi gần nhất
+        self._last_voice_call: dict = {}
+
+    @staticmethod
+    def _infer_model_type(file_name: str) -> str:
+        """Đoán model_type từ tên file khi giao diện không gửi kèm.
+        rf_detr/rf_det* dùng đầu ra khác YOLO nên engine cần "rf_detect"."""
+        name = (file_name or "").lower()
+        if name.startswith("rf_") or "rf_detr" in name or "rf_det" in name:
+            return "rf_detect"
+        return "yolov8_detect"
+
+    @classmethod
+    def build_spec(cls, req: RestrictedAreaDTO) -> AIJobSpec:
+        """Spec ĐỘNG theo lựa chọn trên giao diện; trường nào bỏ trống thì lấy
+        mặc định của RESTRICTED_AREA_SPEC (AIJobSpec là frozen dataclass)."""
+        model_file = (req.modelFile or "").strip() or RESTRICTED_AREA_SPEC.model_file_1
+        model_type = (req.modelType or "").strip() or (
+            RESTRICTED_AREA_SPEC.model_type_1
+            if model_file == RESTRICTED_AREA_SPEC.model_file_1
+            else cls._infer_model_type(model_file)
+        )
+        # classFilter: None = không gửi -> giữ mặc định; "" = giữ TẤT CẢ lớp.
+        class_filter = (
+            RESTRICTED_AREA_SPEC.class_filter
+            if req.classFilter is None
+            else req.classFilter.strip()
+        )
+        return dc_replace(
+            RESTRICTED_AREA_SPEC,
+            model_file_1=model_file,
+            model_type_1=model_type,
+            class_filter=class_filter,
+        )
 
     async def restricted_area(self, db: AsyncSession, req: RestrictedAreaDTO):
-        return await ai_job_service.upsert(db, req, RESTRICTED_AREA_SPEC)
+        spec = self.build_spec(req)
+        # Lưu lựa chọn vào ai_configs.extra_data để giao diện nạp lại đúng
+        # model/lớp đang chạy (engine chỉ giữ path, không giữ tên file).
+        extra = {
+            "modelFile": spec.model_file_1,
+            "modelType": spec.model_type_1,
+            "classFilter": spec.class_filter or "",
+        }
+        return await ai_job_service.upsert(db, req, spec, extra_data=extra)
+
+    async def get_settings(self, db: AsyncSession, camera_id: str) -> dict:
+        """Model/lớp đang áp cho camera này + mặc định (cho giao diện hiển thị)."""
+        row = (await db.execute(
+            select(AIConfig).where(
+                AIConfig.camera_id == camera_id,
+                AIConfig.type == TypeConfigAiEnum.RESTRICTED_AREA.value,
+            )
+        )).scalars().first()
+        extra = (row.extra_data if row and isinstance(row.extra_data, dict) else {}) or {}
+        return {
+            "modelFile": extra.get("modelFile") or RESTRICTED_AREA_SPEC.model_file_1,
+            "modelType": extra.get("modelType") or RESTRICTED_AREA_SPEC.model_type_1,
+            "classFilter": extra.get("classFilter")
+            if extra.get("classFilter") is not None
+            else (RESTRICTED_AREA_SPEC.class_filter or ""),
+            "defaults": {
+                "modelFile": RESTRICTED_AREA_SPEC.model_file_1,
+                "modelType": RESTRICTED_AREA_SPEC.model_type_1,
+                "classFilter": RESTRICTED_AREA_SPEC.class_filter or "",
+            },
+        }
 
     async def test_inference(
         self,
@@ -125,7 +227,7 @@ class RestrictedAreaService(AIServiceBase):
             )
             if paths is None:
                 return
-            full_url, crop_url = paths
+            full_url, crop_url, box = paths
             async with session_factory() as db:
                 event = RestrictedArea(
                     camera_id=str(meta["cameraId"]),
@@ -133,6 +235,10 @@ class RestrictedAreaService(AIServiceBase):
                     timestamp=int(timestamp),
                     image_full=full_url,
                     image_crop=crop_url,
+                    box_x1=box["x1"] if box else None,
+                    box_y1=box["y1"] if box else None,
+                    box_x2=box["x2"] if box else None,
+                    box_y2=box["y2"] if box else None,
                 )
                 db.add(event)
                 await db.commit()
@@ -150,9 +256,49 @@ class RestrictedAreaService(AIServiceBase):
                 "timestamp": int(event.timestamp),
                 "image_full": event.image_full,
                 "image_crop": event.image_crop,
+                "box": box,
             })
         except Exception as exc:
             print(f"restricted-area persist error: {exc}", file=sys.stderr)
+
+    @staticmethod
+    def _voice_call_blocking(camera_id: str) -> None:
+        """Gọi API voip24h. CHẠY TRONG THREAD RIÊNG — requests là blocking, gọi
+        thẳng trên vòng lặp sự kiện sẽ đứng toàn bộ đường ống AI trong lúc chờ
+        mạng."""
+        payload = {
+            "voip": VOICE_ALERT_VOIP,
+            "phone": VOICE_ALERT_PHONE,
+            "data_speech": VOICE_ALERT_TEXT,
+            "LanguageCode": VOICE_ALERT_LANGUAGE,
+        }
+        headers = {"Cookie": VOICE_ALERT_COOKIE} if VOICE_ALERT_COOKIE else {}
+        try:
+            response = requests.post(
+                VOICE_ALERT_URL,
+                headers=headers,
+                data=payload,
+                timeout=VOICE_ALERT_TIMEOUT_S,
+            )
+            print(
+                f"restricted_area voice call camera={camera_id} "
+                f"phone={VOICE_ALERT_PHONE} status={response.status_code} "
+                f"body={response.text[:300]}"
+            )
+        except Exception as exc:
+            # Không ném ra ngoài: cuộc gọi hỏng thì vẫn phải ghi sự kiện.
+            print(f"restricted-area voice call error: {exc}", file=sys.stderr)
+
+    def _fire_voice_call(self, camera_id: str, timestamp: float) -> None:
+        if not VOICE_ALERT_ENABLED:
+            return
+        last = self._last_voice_call.get(camera_id)
+        if last is not None and timestamp - last < self._VOICE_CALL_COOLDOWN_S:
+            return
+        # Đóng dấu TRƯỚC khi gọi, để hai sự kiện sát nhau trong cùng một frame
+        # không cùng lọt qua.
+        self._last_voice_call[camera_id] = timestamp
+        asyncio.create_task(asyncio.to_thread(self._voice_call_blocking, camera_id))
 
     def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         parent = self._find_parent(meta, id)
@@ -169,6 +315,7 @@ class RestrictedAreaService(AIServiceBase):
         asyncio.create_task(
             self._persist_event(meta, parent, full_jpeg, id, timestamp)
         )
+        # self._fire_voice_call(str(meta["cameraId"]), timestamp)
 
     def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         print(f"restricted_area dwell_alert id={id}")

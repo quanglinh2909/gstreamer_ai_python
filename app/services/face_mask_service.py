@@ -138,7 +138,7 @@ class FaceMaskService(AIServiceBase):
     # first-time confirmation and the periodic re-alert path so both behave
     # identically.
     def _fire_alert(self, id, class_id, meta, full_jpeg, x1, y1, x2, y2, timestamp,
-                    is_save=True, alert_sound=True, barrier_duration=0.5):
+                    is_save=True, alert_sound=True, barrier_duration=0.5, confidence=0.0):
         if class_id == 3:
             print(f"face_mask in_the_area id={id} - Face detected (no mask)")
             try:
@@ -152,6 +152,7 @@ class FaceMaskService(AIServiceBase):
                     track_uuid=id, timestamp=time.time(), mask_status="face",
                     bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
                     image=full_jpeg,
+                    camera_id=str(meta["cameraId"]), confidence=float(confidence or 0.0),
                 )
         elif class_id == 5:
             print(f"face_mask in_the_area id={id} - Mask detected")
@@ -162,6 +163,7 @@ class FaceMaskService(AIServiceBase):
                     track_uuid=id, timestamp=time.time(), mask_status="face-mask",
                     bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
                     image=full_jpeg,
+                    camera_id=str(meta["cameraId"]), confidence=float(confidence or 0.0),
                 )
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
@@ -220,7 +222,8 @@ class FaceMaskService(AIServiceBase):
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
                                  x1, y1, x2, y2, timestamp, is_save=True,
                                  alert_sound=alert_sound,
-                                 barrier_duration=barrier_duration)
+                                 barrier_duration=barrier_duration,
+                                 confidence=secondary_conf)
         elif re_alert_seconds > 0:
             # Already confirmed and still standing there — re-alert on interval.
             last_alert_ts = hunmain_entry.get("last_alert_ts", timestamp)
@@ -229,7 +232,8 @@ class FaceMaskService(AIServiceBase):
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
                                  x1, y1, x2, y2, timestamp, is_save=False,
                                  alert_sound=alert_sound,
-                                 barrier_duration=barrier_duration)
+                                 barrier_duration=barrier_duration,
+                                 confidence=secondary_conf)
         
         
 

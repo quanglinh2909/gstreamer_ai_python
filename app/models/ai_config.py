@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, String, text
+from sqlalchemy import JSON, Boolean, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -23,4 +23,10 @@ class AIConfig(Base):
     # layer (default=dict) and in the DB (server_default '{}').
     extra_data: Mapped[dict] = mapped_column(
         JSON, nullable=False, default=dict, server_default=text("'{}'")
+    )
+    # Ghi khung phát hiện xuống bảng detection_slice để XEM LẠI vẽ được
+    # box/pose và tìm sự kiện theo vùng vẽ trên hình. MẶC ĐỊNH TẮT — bật là
+    # ghi liên tục theo mỗi khung hình AI xử lý.
+    save_detections: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
     )

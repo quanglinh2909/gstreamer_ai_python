@@ -1,3 +1,5 @@
+import time
+
 import cv2
 import numpy as np
 
@@ -5,9 +7,29 @@ import numpy as np
 class PushEventMetadata:
     def __init__(self):
         self.event_queue = []
+        self._last_id = 0
+
+    def _next_id(self) -> int:
+        """Id DUY NHẤT cho mỗi sự kiện khẩu trang.
+
+        Khẩu trang là loại DUY NHẤT không có bảng DB, nên trước đây nó gửi
+        thẳng `track_uuid` (id của tracker) làm `id`. Mọi bên tiêu thụ đều
+        ngầm hiểu `id` là định danh của SỰ KIỆN và khử trùng theo nó — thế là
+        mọi sự kiện sau của cùng một track bị vứt lặng lẽ. Cụ thể: bảng sự
+        kiện ở trang Xem lại khử trùng bằng `${tab}-${ev.id}`, nên track 0 báo
+        "có khẩu trang" trước thì mọi lần "không khẩu trang" sau đó của chính
+        track 0 biến mất. Tường Live View thì không dính vì nó cộng thêm một
+        bộ đếm vào khoá.
+
+        Lấy mốc thời gian mili giây làm nền để id vẫn tăng và không đụng hàng
+        sau khi khởi động lại; `max(...)+1` lo trường hợp hai sự kiện rơi vào
+        cùng một mili giây.
+        """
+        self._last_id = max(self._last_id + 1, int(time.time() * 1000))
+        return self._last_id
 
     def push_event(self, track_uuid, timestamp, mask_status, bbox_x1, bbox_y1, bbox_x2, bbox_y2,
-                   image):
+                   image, camera_id="", confidence=0.0):
         _mask_status = "unknown"
         _detection_class = "unknown"
         if mask_status == "face":
@@ -52,6 +74,43 @@ class PushEventMetadata:
         if not success_crop:
             return
         cropped_bytes = cropped_encoded.tobytes()
+
+        # Bắn REALTIME lên WebSocket /ws/mask-events cho panel Xem trực tiếp.
+        # Ảnh đi kèm dạng data URL base64 (mask event KHÔNG lưu vào /uploads như
+        # face/plate/restricted), nên gói tự chứa. Import trong hàm để tránh
+        # phụ thuộc vòng lúc nạp module tiện ích.
+        try:
+            import base64
+            from app.ws.mask_event_ws import mask_event_broadcaster
+
+            def _data_url(b):
+                return "data:image/jpeg;base64," + base64.b64encode(b).decode("ascii")
+
+            # bbox CHUẨN HOÁ [0,1] theo khung FULL để frontend vẽ box đúng chỗ dù
+            # ảnh hiển thị ở kích thước nào (x1,y1,x2,y2 đã được kẹp vào ảnh ở trên).
+            box = {
+                "x1": x1 / w, "y1": y1 / h,
+                "x2": x2 / w, "y2": y2 / h,
+            }
+            mask_event_broadcaster.publish({
+                # id của SỰ KIỆN (duy nhất). Id của tracker đi riêng ở
+                # `track_id` để không mất thông tin.
+                "id": self._next_id(),
+                "track_id": track_uuid,
+                "camera_id": camera_id,
+                "confidence": float(confidence),
+                "timestamp": int(timestamp),
+                "mask_status": _mask_status,
+                # Gửi ẢNH FULL (cả khung) + box: người dùng muốn xem toàn cảnh có
+                # khung đánh dấu chỗ phát hiện, không phải chỉ vùng cắt. Kèm crop
+                # để làm ảnh nhỏ dự phòng.
+                "image_full": _data_url(img_bytes),
+                "image_crop": _data_url(cropped_bytes),
+                "box": box,
+            })
+        except Exception as exc:
+            import sys
+            print(f"mask ws publish error: {exc}", file=sys.stderr)
 
         event_data = {
             "id": track_uuid,  # Sử dụng track_uuid làm unique id
