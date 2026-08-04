@@ -147,54 +147,21 @@ class PlateRecognitionService(AIServiceBase):
         # id, nên phải loại bỏ mọi ký tự không an toàn cho tên file.
         return re.sub(r"[^A-Za-z0-9_-]", "", text_plate) or "unknown"
 
+    # Ghi ảnh + hàng + WebSocket + đánh thức ghi hình nằm ở
+    # AIServiceBase.save_event; ở đây chỉ còn cột và trường RIÊNG của biển số.
+    EVENT_MODEL = EventPlate
+    EVENT_BROADCASTER = plate_event_broadcaster
+    EVENT_SOURCE = "plate_recognition"
+
     async def _persist_event(self, meta, parent, full_jpeg, text_plate, timestamp):
-        # Import trễ để tránh phụ thuộc vòng lúc nạp module; tới lúc task này
-        # chạy thì process_ai_service._session_factory đã được tạo trên đúng
-        # event loop mà _persist_event đang chạy (loop của recv-loop).
-        from app.services.process_ai_service import process_ai_service
-        session_factory = process_ai_service._session_factory
-        if session_factory is None:
-            return
-        try:
-            paths = await asyncio.to_thread(
-                self._save_images_blocking, full_jpeg, meta, parent, text_plate,
-            )
-            if paths is None:
-                return
-            full_url, crop_url, box = paths
-            async with session_factory() as db:
-                event = EventPlate(
-                    camera_id=str(meta["cameraId"]),
-                    plate_number=text_plate,
-                    confidence=float(parent.get("score", 0.0)),
-                    timestamp=int(timestamp),
-                    image_full=full_url,
-                    image_crop=crop_url,
-                    box_x1=box["x1"] if box else None,
-                    box_y1=box["y1"] if box else None,
-                    box_x2=box["x2"] if box else None,
-                    box_y2=box["y2"] if box else None,
-                )
-                db.add(event)
-                await db.commit()
-            # session_factory đặt expire_on_commit=False nên event.id vẫn còn
-            # giá trị sau khi commit mà không cần refresh. Đẩy đúng dòng đó
-            # tới mọi client đang nghe WebSocket.
-            plate_event_broadcaster.publish({
-                "id": event.id,
-                "camera_id": event.camera_id,
-                "plate_number": event.plate_number,
-                "whitelisted": plate_white_list_service.is_whitelisted(
-                    event.plate_number
-                ),
-                "confidence": float(event.confidence),
-                "timestamp": int(event.timestamp),
-                "image_full": event.image_full,
-                "image_crop": event.image_crop,
-                "box": box,
-            })
-        except Exception as exc:
-            print(f"plate persist error: {exc}", file=sys.stderr)
+        await self.save_event(
+            meta, parent, full_jpeg, text_plate, timestamp,
+            columns={"plate_number": text_plate},
+            payload={
+                "plate_number": text_plate,
+                "whitelisted": plate_white_list_service.is_whitelisted(text_plate),
+            },
+        )
 
     @staticmethod
     def _min_plate_len(extra_data):

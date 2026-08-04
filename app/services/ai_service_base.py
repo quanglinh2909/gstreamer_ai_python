@@ -11,10 +11,17 @@ Only three things actually differ between services: the crop geometry,
 the upload subfolder, and the filename suffix. Those are class attributes
 (and one small override) here instead of four near-identical copies of
 the same code.
+
+Lưu MỘT sự kiện cũng là một thủ tục giống hệt nhau ở cả bốn loại (ghi ảnh →
+chèn hàng → bắn WebSocket → đánh thức ghi hình), nên nó nằm ở `save_event`
+dưới đây; lớp con chỉ khai `EVENT_MODEL` / `EVENT_BROADCASTER` và đưa thêm
+cột riêng của mình.
 """
 
+import asyncio
 import datetime
 import os
+import sys
 
 import cv2
 import numpy as np
@@ -40,6 +47,13 @@ class AIServiceBase:
     # Subfolder under /uploads for this service's event images. Required
     # only by services that call `_save_images_blocking`.
     EVENT_FOLDER = None
+
+    #: Lớp model (kế thừa AiEventMixin) mà `save_event` chèn hàng vào.
+    EVENT_MODEL = None
+    #: CameraFilteredBroadcaster của loại này — nơi `save_event` bắn realtime.
+    EVENT_BROADCASTER = None
+    #: Nhãn ngắn cho log lỗi và cho `source` gửi sang engine lúc đánh thức ghi.
+    EVENT_SOURCE = "ai"
 
     # Crop geometry. `CROP_PAD_*` is outward padding as a ratio of the
     # bbox width/height; `CROP_OUTPUT_*` is the fixed output size (aspect
@@ -152,3 +166,112 @@ class AIServiceBase:
             f"/uploads/{folder_rel}/{stem}_crop.jpg",
             box,
         )
+
+    # ─── Lưu một sự kiện: ảnh → hàng DB → WebSocket → ghi hình ──────────
+    #
+    # Bốn service đã có bốn bản `_persist_event` chỉ khác nhau ở TÊN MODEL và
+    # vài cột riêng. Gộp về đây để thêm một loại sự kiện không còn phải chép
+    # lại cả khối try/except + to_thread + broadcast.
+
+    async def save_event(
+        self,
+        meta,
+        parent,
+        full_jpeg,
+        stem_value,
+        timestamp,
+        columns=None,
+        payload=None,
+        confidence=None,
+    ):
+        """Ghi một sự kiện của loại này và trả về hàng đã lưu (hoặc None).
+
+        `columns` là các cột RIÊNG của loại (plate_number, mask_status…);
+        `payload` là các trường riêng thêm vào gói WebSocket. `confidence` để
+        ghi đè điểm tin cậy: khuôn mặt lưu ĐỘ GIỐNG với người đã đăng ký, không
+        phải điểm phát hiện của box.
+
+        Trả None khi không có gì để lưu (thiếu ảnh, crop suy biến, chưa có
+        session factory) — chỗ gọi không cần phân biệt vì sự kiện thiếu ảnh
+        thì lưu cũng chỉ ra một thẻ trống.
+        """
+        from app.services.process_ai_service import process_ai_service
+        session_factory = process_ai_service._session_factory
+        if session_factory is None:
+            return None
+        try:
+            paths = await asyncio.to_thread(
+                self._save_images_blocking, full_jpeg, meta, parent, stem_value,
+            )
+            if paths is None:
+                return None
+            full_url, crop_url, box = paths
+
+            event = self.EVENT_MODEL(
+                camera_id=str(meta["cameraId"]),
+                confidence=float(
+                    parent.get("score", 0.0) if confidence is None else confidence
+                ),
+                timestamp=int(timestamp),
+                image_full=full_url,
+                image_crop=crop_url,
+                box_x1=box["x1"] if box else None,
+                box_y1=box["y1"] if box else None,
+                box_x2=box["x2"] if box else None,
+                box_y2=box["y2"] if box else None,
+                **(columns or {}),
+            )
+            async with session_factory() as db:
+                db.add(event)
+                await db.commit()
+
+            # session_factory đặt expire_on_commit=False nên event.id vẫn còn
+            # sau commit, không cần refresh thêm một vòng.
+            if self.EVENT_BROADCASTER is not None:
+                self.EVENT_BROADCASTER.publish({
+                    "id": event.id,
+                    "camera_id": event.camera_id,
+                    "confidence": float(event.confidence),
+                    "timestamp": int(event.timestamp),
+                    "image_full": event.image_full,
+                    "image_crop": event.image_crop,
+                    "box": box,
+                    **(payload or {}),
+                })
+
+            self.arm_recording(str(meta["cameraId"]))
+            return event
+        except Exception as exc:
+            print(f"{self.EVENT_SOURCE} persist error: {exc}", file=sys.stderr)
+            return None
+
+    # ─── Ghi hình theo sự kiện AI ───────────────────────────────────────
+
+    def arm_recording(self, camera_id: str) -> None:
+        """Báo engine "camera này vừa có sự kiện AI" để nó GIỮ đoạn ghi.
+
+        Gọi cho MỌI sự kiện, không có công tắc riêng từng AI. "Chỉ ghi khi có
+        sự kiện" là một cài đặt của CAMERA (chế độ ghi 'motion' + ghi
+        trước/ghi sau), nên chính engine mới là chỗ quyết định — nó vứt mọi
+        đoạn không có gì xảy ra và lời gọi này giữ lại đoạn quanh sự kiện, đúng
+        cơ chế mà chuyển động vẫn dùng.
+
+        Camera đang "Luôn ghi" thì engine trả về "không có đoạn nào để giữ" và
+        chẳng tốn gì thêm. Một sự kiện AI đã qua khử trùng theo track nên tần
+        suất rất thấp — không đáng để thêm một công tắc nữa chỉ để tiết kiệm
+        một lời gọi HTTP nội bộ.
+
+        Fire-and-forget: sự kiện đã nằm trong DB rồi, engine không trả lời
+        được thì cũng không được để mất sự kiện.
+        """
+        asyncio.create_task(self._arm_recording_call(camera_id))
+
+    async def _arm_recording_call(self, camera_id: str) -> None:
+        from app.api.httpx_client import HTTPXClient
+        try:
+            await HTTPXClient.post(
+                f"/cameras/{camera_id}/ai-event",
+                json={"source": self.EVENT_SOURCE},
+            )
+        except Exception as exc:
+            print(f"{self.EVENT_SOURCE} arm recording failed: {exc}", file=sys.stderr)

@@ -1,4 +1,6 @@
+import asyncio
 import time
+from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -6,9 +8,12 @@ from app.utils.play_sound import play_sound
 from app.utils.push_envent_metadata import push_event_metadata
 from app.dto.face_mask_dto import FaceMaskDTO
 from app.enum.config_ai_enum import TypeConfigAiEnum
+from app.models.event_mask import EventMask
+from app.repositories.event_mask_repository import EventMaskRepository
 from app.services.ai_job_service import AIJobSpec, ai_job_service
 from app.services.ai_service_base import AIServiceBase
 from app.utils.open_door.door_manager import door_manager
+from app.ws.mask_event_ws import mask_event_broadcaster
 
 
 FACE_MASK_SPEC = AIJobSpec(
@@ -51,9 +56,39 @@ class FaceMaskService(AIServiceBase):
         return await ai_job_service.upsert(db, req, FACE_MASK_SPEC, extra_data=extra_data)
 
     # ─── Detection event hooks (driven by process_ai_service) ────────
-    # `_find_parent` comes from AIServiceBase. This service pushes events
-    # through push_event_metadata rather than the shared image-saving
-    # helper, so it needs no EVENT_FOLDER / crop geometry.
+    #
+    # Khẩu trang giờ lưu như ba loại AI kia: ảnh xuống /uploads/masks/, hàng
+    # xuống bảng event_mask, WebSocket mang ĐƯỜNG DẪN thay vì base64. Trước đây
+    # sự kiện chỉ bay qua WebSocket rồi mất — tải lại trang là trắng bảng, và
+    # bộ dọn dung lượng không có gì để đếm.
+    #
+    # push_event_metadata vẫn được gọi, nhưng chỉ còn nuôi hàng đợi của luồng
+    # MJPEG cho thiết bị ngoài (device_router) — nó cần BYTES thô, không dùng
+    # được URL.
+    EVENT_FOLDER = "masks"
+    EVENT_MODEL = EventMask
+    EVENT_BROADCASTER = mask_event_broadcaster
+    EVENT_SOURCE = "face_mask"
+
+    # Box của khẩu trang là box NGƯỜI (class 0) — cùng hình học với vùng cấm.
+    CROP_PAD_LEFT = 0.2
+    CROP_PAD_RIGHT = 0.2
+    CROP_PAD_TOP = 0.2
+    CROP_PAD_BOTTOM = 0.2
+    CROP_OUTPUT_W = 400
+    CROP_OUTPUT_H = 480
+
+    # classId của model -> mask_status lưu vào DB và gửi lên giao diện.
+    _MASK_STATUS = {3: "not_wearing_mask", 5: "wearing_mask"}
+
+    async def list_events(
+        self,
+        db: AsyncSession,
+        page: int,
+        size: int,
+        camera_id: Optional[str] = None,
+    ):
+        return await EventMaskRepository.list_paginated(db, page, size, camera_id)
 
     def calculate_containment(self, person_box, face_box):
         """Tính tỷ lệ face nằm trong person (0-1)"""
@@ -137,8 +172,12 @@ class FaceMaskService(AIServiceBase):
     # Emit the alert (sound + event) for a confirmed class. Shared by the
     # first-time confirmation and the periodic re-alert path so both behave
     # identically.
-    def _fire_alert(self, id, class_id, meta, full_jpeg, x1, y1, x2, y2, timestamp,
-                    is_save=True, alert_sound=True, barrier_duration=0.5, confidence=0.0):
+    def _fire_alert(self, id, class_id, meta, full_jpeg, parent, timestamp,
+                    is_save=True, alert_sound=True, barrier_duration=0.5,
+                    confidence=0.0):
+        x1, y1 = parent.get("x1"), parent.get("y1")
+        x2, y2 = parent.get("x2"), parent.get("y2")
+
         if class_id == 3:
             print(f"face_mask in_the_area id={id} - Face detected (no mask)")
             try:
@@ -146,25 +185,38 @@ class FaceMaskService(AIServiceBase):
                 print(f"Barrier opened ")
             except Exception as e:
                 print(f"Failed to open barrier: {e}")
-
-            if is_save:
-                push_event_metadata.push_event(
-                    track_uuid=id, timestamp=time.time(), mask_status="face",
-                    bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
-                    image=full_jpeg,
-                    camera_id=str(meta["cameraId"]), confidence=float(confidence or 0.0),
-                )
+            device_status = "face"
         elif class_id == 5:
             print(f"face_mask in_the_area id={id} - Mask detected")
             if alert_sound:
                 play_sound.q_play_sound.put({"link": "access/warning.mp3", "time": timestamp})
-            if is_save:
-                push_event_metadata.push_event(
-                    track_uuid=id, timestamp=time.time(), mask_status="face-mask",
-                    bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
-                    image=full_jpeg,
-                    camera_id=str(meta["cameraId"]), confidence=float(confidence or 0.0),
-                )
+            device_status = "face-mask"
+        else:
+            return
+
+        if not is_save:
+            return
+
+        # Luồng MJPEG cho thiết bị ngoài: cần BYTES thô nên vẫn đi đường cũ.
+        push_event_metadata.push_event(
+            track_uuid=id, timestamp=time.time(), mask_status=device_status,
+            bbox_x1=int(x1), bbox_y1=int(y1), bbox_x2=int(x2), bbox_y2=int(y2),
+            image=full_jpeg,
+            camera_id=str(meta["cameraId"]), confidence=float(confidence or 0.0),
+        )
+        # Ảnh + hàng DB + WebSocket + đánh thức ghi hình: AIServiceBase.
+        asyncio.create_task(self.save_event(
+            meta, parent, full_jpeg, id, timestamp,
+            columns={
+                "mask_status": self._MASK_STATUS.get(class_id, "unknown"),
+                "track_id": int(id),
+            },
+            payload={
+                "mask_status": self._MASK_STATUS.get(class_id, "unknown"),
+                "track_id": int(id),
+            },
+            confidence=float(confidence or 0.0),
+        ))
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         parent = self._find_parent(meta, id)
@@ -192,11 +244,6 @@ class FaceMaskService(AIServiceBase):
         if best_match_class_id == "UNKNOWN":
             return
 
-        x1 = parent.get("x1")
-        y1 = parent.get("y1")
-        x2 = parent.get("x2")
-        y2 = parent.get("y2")
-
         count_confirm = hunmain_entry.get("count_confirm", 0)
         class_id_pre = hunmain_entry.get("class_id_pre")
         if class_id_pre != best_match_class_id:
@@ -220,7 +267,7 @@ class FaceMaskService(AIServiceBase):
                 hunmain_entry["class_id_confirm"] = best_match_class_id
                 hunmain_entry["last_alert_ts"] = timestamp
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
-                                 x1, y1, x2, y2, timestamp, is_save=True,
+                                 parent, timestamp, is_save=True,
                                  alert_sound=alert_sound,
                                  barrier_duration=barrier_duration,
                                  confidence=secondary_conf)
@@ -230,7 +277,7 @@ class FaceMaskService(AIServiceBase):
             if timestamp - last_alert_ts >= re_alert_seconds:
                 hunmain_entry["last_alert_ts"] = timestamp
                 self._fire_alert(id, best_match_class_id, meta, full_jpeg,
-                                 x1, y1, x2, y2, timestamp, is_save=False,
+                                 parent, timestamp, is_save=False,
                                  alert_sound=alert_sound,
                                  barrier_duration=barrier_duration,
                                  confidence=secondary_conf)

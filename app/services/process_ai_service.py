@@ -57,10 +57,17 @@ class ProcessAiService:
         self._debug_lock = threading.Lock()
         self._debug_subscribers: dict = {}   # (cam, job) -> refcount
         self._debug_latest: dict = {}        # (cam, job) -> {meta, full_jpeg, seq, polygons, primary_conf}
-        # Ảnh JPEG đầy MỚI NHẤT theo camera. Engine giới hạn tần suất encode JPEG
-        # (encode phần mềm 1080p tốn CPU) nên có khung metadata KHÔNG kèm ảnh.
-        # Sự kiện rơi đúng khung đó vẫn cần ảnh -> lấy ảnh mới nhất (trễ tối đa
-        # ~vài trăm ms, thừa đủ cho ảnh sự kiện). camera_id -> bytes.
+        # Ảnh JPEG đầy MỚI NHẤT theo camera, KÈM hộp của chính khung ảnh đó.
+        #
+        # Engine giới hạn tần suất encode JPEG (encode phần mềm 1080p tốn CPU,
+        # xem kDetJpegMinGapMs trong AiJob.hpp) nên nhiều khung metadata KHÔNG
+        # kèm ảnh. Sự kiện rơi đúng khung đó vẫn cần ảnh -> dùng ảnh mới nhất.
+        #
+        # PHẢI lưu kèm hộp: lúc đầu chỉ lưu bytes ảnh, còn hộp thì lấy của khung
+        # HIỆN TẠI -> hộp vẽ và ảnh crop lệch đúng bằng quãng đường vật thể đi
+        # được trong ≤400ms. Đứng yên thì không thấy gì, nhưng xe máy qua cổng
+        # là hộp rơi ra mặt đường trống và ảnh crop biển số thành ảnh nền —
+        # tức là BẰNG CHỨNG của sự kiện bị sai. camera_id -> (bytes, {tid: bbox}).
         self._last_full_jpeg: dict = {}
         # Dedup the "AI config not found" warning: C++ engine workers that
         # never had a Python-side AIConfig (typically orphan jobs left
@@ -68,6 +75,39 @@ class ProcessAiService:
         # this line every frame. Log once per (cam, job) until that pair
         # is either resolved or this process restarts.
         self._unknown_job_logged: set = set()
+
+    @staticmethod
+    def _align_meta_to_image(meta, stale_boxes):
+        """meta với toạ độ lùi về khớp KHUNG ẢNH đang cầm.
+
+        Engine bỏ encode JPEG ở phần lớn khung (kDetJpegMinGapMs) nên khi một
+        sự kiện rơi vào khung không kèm ảnh, ta mượn ảnh của khung trước. Hộp
+        thì vẫn là của khung HIỆN TẠI — trộn hai thứ đó lại là hộp lệch đúng
+        bằng quãng đường vật thể đi trong ≤400ms: đứng yên không thấy gì, xe
+        máy qua cổng thì hộp rơi ra mặt đường và ảnh crop biển số thành ảnh nền.
+
+        CHỈ đổi toạ độ, giữ nguyên phần còn lại: `children` (ký tự biển số) là
+        kết quả OCR của khung hiện tại và vẫn đúng, chỉ vị trí cần lùi lại.
+
+        Id chưa từng xuất hiện trong một khung có ảnh thì không có gì để lùi về
+        — giữ hộp hiện tại, thà lệch còn hơn mất hẳn sự kiện. Hiếm, vì cứ ≤400ms
+        là có một khung kèm ảnh.
+        """
+        if not stale_boxes:
+            return meta
+        patched = []
+        for det in meta.get("detections", []):
+            tid = det.get("tracker_id")
+            box = stale_boxes.get(int(tid)) if tid is not None else None
+            if box is None:
+                patched.append(det)
+                continue
+            shifted = dict(det)
+            shifted["x1"], shifted["y1"], shifted["x2"], shifted["y2"] = box
+            patched.append(shifted)
+        aligned = dict(meta)
+        aligned["detections"] = patched
+        return aligned
 
     def invalidate(self, camera_id: str, job_id: Optional[str] = None) -> None:
         """Drop the cached per-(camera, job) state so the next inbound
@@ -347,10 +387,14 @@ class ProcessAiService:
             # nhiều khung tới KHÔNG kèm ảnh. Giữ ảnh đầy mới nhất theo camera và
             # thay vào khi khung hiện tại rỗng, để sự kiện (entered_zone...) luôn
             # có ảnh dù rơi đúng khung bị bỏ encode. Ảnh trễ ≤ ~kDetJpegMinGapMs.
-            if full_jpeg:
-                self._last_full_jpeg[camera_id] = full_jpeg
-            else:
-                full_jpeg = self._last_full_jpeg.get(camera_id) or full_jpeg
+            # Khung này có ảnh RIÊNG hay phải mượn ảnh cũ? Ghi cache thì phải
+            # đợi tới sau tracker (lúc đó tracker_id mới được gắn vào detections).
+            frame_has_own_jpeg = bool(full_jpeg)
+            stale_boxes = None
+            if not frame_has_own_jpeg:
+                cached = self._last_full_jpeg.get(camera_id)
+                if cached:
+                    full_jpeg, stale_boxes = cached
 
             # Pick up any API-driven config changes before deciding whether
             # the existing cached state is still valid.
@@ -470,6 +514,9 @@ class ProcessAiService:
                     self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons,
                                             primary_conf, overlap_threshold, class_meta)
                     detections = ProcessAiHepper.empty_tracked_detections()
+                    # Không có id nào để căn lại, nhưng biến vẫn phải tồn tại
+                    # cho vòng lặp vùng bên dưới.
+                    meta_events = meta
                 else:
                     detections = detections[detections.tracker_id >= 0]
 
@@ -486,10 +533,29 @@ class ProcessAiService:
                                     raw_dets[j]["tracker_id"] = int(detections.tracker_id[i])
                                     break
 
+                    # Khung này tự có ảnh -> ghi cache kèm hộp CỦA CHÍNH NÓ,
+                    # để khung sau không có ảnh còn mượn được cặp ảnh-hộp khớp
+                    # nhau. Chỉ giữ toạ độ, không giữ cả dict (children/score
+                    # của khung cũ không dùng tới và giữ lại chỉ tốn bộ nhớ).
+                    if frame_has_own_jpeg:
+                        self._last_full_jpeg[camera_id] = (
+                            full_jpeg,
+                            {
+                                int(d["tracker_id"]): (d["x1"], d["y1"], d["x2"], d["y2"])
+                                for d in raw_dets
+                                if d.get("tracker_id") is not None
+                            },
+                        )
+
+                    # Từ đây trở đi mọi thứ VẼ LÊN / CẮT TỪ `full_jpeg` phải
+                    # dùng meta đã căn lại theo đúng khung ảnh đó.
+                    meta_events = self._align_meta_to_image(meta, stale_boxes)
+
                     # Stash with tracker_ids tagged onto raw_dets, so the
                     # MJPEG overlay can show them.
-                    self._stash_debug_frame(camera_id, job_id, meta, full_jpeg, polygons,
-                                            primary_conf, overlap_threshold, class_meta)
+                    self._stash_debug_frame(camera_id, job_id, meta_events, full_jpeg,
+                                            polygons, primary_conf, overlap_threshold,
+                                            class_meta)
 
                 # Khung phát hiện dùng cho HAI việc: lớp phủ trực tiếp và ghi
                 # xuống DB để xem lại. Đặt SAU cả hai nhánh trên (và ngoài
@@ -538,25 +604,25 @@ class ProcessAiService:
                         if tid not in ids_in_zone[zone_idx]:
                             # print(f"ID {tid} ENTERED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "entered_zone"):
-                                service_ai.entered_zone(tid, meta, full_jpeg, now, secondary_conf, extra_data, zone_idx)
+                                service_ai.entered_zone(tid, meta_events, full_jpeg, now, secondary_conf, extra_data, zone_idx)
                             ids_in_zone[zone_idx].add(tid)
                             entered_at[zone_idx][tid] = now
                         elif dwell_seconds > 0 and tid not in dwell_alerted[zone_idx]:
                             if now - entered_at[zone_idx].get(tid, now) >= dwell_seconds:
                                 # print(f"ID {tid} STAYED in zone {zone_idx} for {dwell_seconds}s")
                                 if service_ai is not None and hasattr(service_ai, "dwell_alert"):
-                                    service_ai.dwell_alert(tid, meta, full_jpeg, now, secondary_conf, extra_data, zone_idx)
+                                    service_ai.dwell_alert(tid, meta_events, full_jpeg, now, secondary_conf, extra_data, zone_idx)
                                 dwell_alerted[zone_idx].add(tid)
                         else:
                             if service_ai is not None and hasattr(service_ai, "in_the_area"):
-                                service_ai.in_the_area(tid, meta, full_jpeg, now, secondary_conf, extra_data, zone_idx)
+                                service_ai.in_the_area(tid, meta_events, full_jpeg, now, secondary_conf, extra_data, zone_idx)
 
                     for tid in list(ids_in_zone[zone_idx] - current_ids):
                         exit_pending[zone_idx][tid] = exit_pending[zone_idx].get(tid, 0) + 1
                         if exit_pending[zone_idx][tid] >= exit_grace:
                             # print(f"ID {tid} EXITED zone {zone_idx}")
                             if service_ai is not None and hasattr(service_ai, "exited_zone"):
-                                service_ai.exited_zone(tid, meta, full_jpeg, now, secondary_conf, extra_data, zone_idx)
+                                service_ai.exited_zone(tid, meta_events, full_jpeg, now, secondary_conf, extra_data, zone_idx)
                             ids_in_zone[zone_idx].discard(tid)
                             exit_pending[zone_idx].pop(tid, None)
                             entered_at[zone_idx].pop(tid, None)

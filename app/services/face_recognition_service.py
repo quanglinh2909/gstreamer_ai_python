@@ -299,6 +299,10 @@ class FaceRecognitionService(AIServiceBase):
         identity_id = top.get("identity_id")
         return (int(identity_id) if identity_id is not None else None), similarity
 
+    EVENT_MODEL = EventFace
+    EVENT_BROADCASTER = face_event_broadcaster
+    EVENT_SOURCE = "face_recognition"
+
     async def _persist_event(
         self, meta, parent, full_jpeg, tid, timestamp, secondary_conf,
         save_unmatched: bool,
@@ -360,59 +364,29 @@ class FaceRecognitionService(AIServiceBase):
         if write_key in self._written_tracks:
             return identity_id
 
-        try:
-            paths = await asyncio.to_thread(
-                self._save_images_blocking, full_jpeg, meta, parent, tid,
+        # Tên người tra TRƯỚC khi ghi, để gói WebSocket mang đủ id + nhãn mà
+        # không phải mở lại session sau commit.
+        identity_name = None
+        async with session_factory() as db:
+            identity_name = await db.scalar(
+                select(Identity.name).where(Identity.id == identity_id)
             )
-            if paths is None:
-                # Ghi ảnh hỏng -> trả None để track ở lại PENDING và khung sau
-                # thử lại. Trả identity_id ở đây là track thành RESOLVED và
-                # lần xuất hiện này mất luôn cả sự kiện lẫn ảnh.
-                return None
-            full_url, crop_url, box = paths
 
-            async with session_factory() as db:
-                event = EventFace(
-                    camera_id=str(meta["cameraId"]),
-                    identity_id=identity_id,
-                    confidence=similarity,
-                    timestamp=int(timestamp),
-                    image_full=full_url,
-                    image_crop=crop_url,
-                    box_x1=box["x1"] if box else None,
-                    box_y1=box["y1"] if box else None,
-                    box_x2=box["x2"] if box else None,
-                    box_y2=box["y2"] if box else None,
-                )
-                db.add(event)
-                await db.commit()
-                self._written_tracks.add(write_key)
-
-                # Resolve the identity name in the same session so the
-                # broadcast carries everything a UI needs (id + label),
-                # then fan out to any WebSocket subscribers. expire_on_commit
-                # is False on this session_factory, so `event.id` stays
-                # populated after the commit without a refresh.
-                identity_name = None
-                if identity_id is not None:
-                    identity_name = await db.scalar(
-                        select(Identity.name).where(Identity.id == identity_id)
-                    )
-            face_event_broadcaster.publish({
-                "id": event.id,
-                "camera_id": event.camera_id,
-                "identity_id": event.identity_id,
-                "name": identity_name,
-                "confidence": float(event.confidence),
-                "timestamp": int(event.timestamp),
-                "image_full": event.image_full,
-                "image_crop": event.image_crop,
-                "box": box,
-            })
-        except Exception as exc:
-            print(f"face persist error: {exc}", file=sys.stderr)
-            # Như trên: hỏng thì để track thử lại chứ đừng khoá nó là xong.
+        # Ghi ảnh + hàng + WebSocket + đánh thức ghi hình: AIServiceBase.
+        # confidence ở đây là ĐỘ GIỐNG với người đã đăng ký, không phải điểm
+        # phát hiện của box.
+        event = await self.save_event(
+            meta, parent, full_jpeg, tid, timestamp,
+            columns={"identity_id": identity_id},
+            payload={"identity_id": identity_id, "name": identity_name},
+            confidence=similarity,
+        )
+        if event is None:
+            # Ghi ảnh hỏng -> trả None để track ở lại PENDING và khung sau thử
+            # lại. Trả identity_id ở đây là track thành RESOLVED và lần xuất
+            # hiện này mất luôn cả sự kiện lẫn ảnh.
             return None
+        self._written_tracks.add(write_key)
         return identity_id
 
     async def _run_match(

@@ -33,7 +33,11 @@ def _clean_name(name: Optional[str]) -> Optional[str]:
 
 class PlateWhiteListService:
     def __init__(self):
-        # plate_number (normalised, UPPER) -> {"last_matched": {camera_id: ts}}.
+        # plate_number (normalised, UPPER) -> {"last_matched": {scope: ts}}.
+        # `scope` = "group:<id>" nếu camera thuộc CỤM CỔNG, ngược lại
+        # "cam:<camera_id>" (PlateGateSettings.cooldown_scope). Camera đứng
+        # riêng vẫn có đồng hồ riêng như trước; các camera cùng cụm chia nhau
+        # một đồng hồ.
         # The ALPR hot path only needs membership ("is this plate
         # whitelisted?"), so a plate that has never opened a barrier keeps an
         # empty dict; process_ai_result fills in the per-camera timestamps it
@@ -184,15 +188,25 @@ class PlateWhiteListService:
             return
 
         now = time.time()
+        # PHẠM VI và THỜI GIAN của đồng hồ chờ — cả hai đã được giải sẵn lúc
+        # nạp cache (plate_white_list_settings_service._build_cache), nên ở
+        # đây không có nhánh if nào về cụm cả:
+        #
+        #   thuộc cụm  -> scope "group:<id>", chờ theo pre_time của CỤM
+        #   đứng riêng -> scope "cam:<id>",   chờ theo pre_time của CAMERA
+        #
+        # Mặc định tách theo camera là CỐ Ý: cổng vào và cổng ra là hai camera
+        # khác nhau, xe vừa vào không được vì thế mà bị khoá ở cổng ra. Cụm
+        # dành cho làn vừa vào vừa ra, nơi hai camera cùng điều khiển MỘT
+        # barrier — xe qua camera 1 mở cổng, chạy tiếp qua camera 2 lại mở lần
+        # nữa nên barrier không kịp đóng.
+        scope = cfg.cooldown_scope
         # Snapshot under the lock: API handlers (FastAPI thread) mutate this
         # dict via create/update/delete while we run on the recv-loop thread,
         # so iterating it directly risks "dict changed size during iteration".
-        #
-        # last_matched tách theo camera: cổng vào và cổng ra là hai camera
-        # khác nhau, xe vừa vào không được vì thế mà bị khoá ở cổng ra.
         with self._cache_lock:
             snapshot = [
-                (key, meta.get("last_matched", {}).get(camera_id, 0.0))
+                (key, meta.get("last_matched", {}).get(scope, 0.0))
                 for key, meta in self.plate_white_list.items()
             ]
         # Chọn biển GẦN NHẤT rồi mới xét thời gian chờ, chứ không lấy biển
@@ -227,23 +241,28 @@ class PlateWhiteListService:
         if best_key is None:
             return
         if best_last_matched:
-            if cfg.pre_time <= 0:
+            if cfg.cooldown_seconds <= 0:
                 # 0 = không cho mở lại: biển này đã mở một lần rồi.
                 return
-            if now - best_last_matched <= cfg.pre_time:
+            if now - best_last_matched <= cfg.cooldown_seconds:
                 return
 
         # Re-check + stamp under the lock; the entry may have been removed by
         # a concurrent delete since the snapshot, and the stamp also rate-
-        # limits the next match (pre_time giây).
+        # limits the next match (cooldown_seconds giây).
         with self._cache_lock:
             entry = self.plate_white_list.get(best_key)
             if entry is None:
                 return
-            entry.setdefault("last_matched", {})[camera_id] = now
+            entry.setdefault("last_matched", {})[scope] = now
         print(
             f"Plate {plate_number} matched whitelist entry {best_key} "
-            f"with distance {best_distance} (camera {camera_id})"
+            f"with distance {best_distance} (camera {camera_id}"
+            # In cả cụm và số giây THỰC SỰ áp dụng: khi cổng không mở, câu hỏi
+            # đầu tiên luôn là "bị chặn bởi chính camera này hay bởi camera
+            # khác cùng cụm, và đang tính theo mốc nào".
+            + (f", cum '{cfg.gate_group_name}'" if cfg.gate_group_name else "")
+            + f", cho {cfg.cooldown_seconds}s)"
         )
         try:
             door_manager.open_door(cfg.barrier_duration)

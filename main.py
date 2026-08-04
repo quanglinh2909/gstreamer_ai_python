@@ -19,7 +19,7 @@ from app.app import api_router
 from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.milvus import close_client, get_client
 from app.repositories.face_vector_repository import FaceVectorRepository
-from app.models import ai_config, detection_slice, event_face, event_plate, identity, identity_plate, parking_lot, parking_lot_event, plate_white_list, plate_white_list_settings, restricted_areas, storage_policy, system_metrics  # noqa: F401 - đăng ký model vào Base.metadata
+from app.models import ai_config, detection_slice, event_face, event_mask, event_plate, identity, identity_plate, parking_lot, parking_lot_event, plate_gate_group, plate_white_list, plate_white_list_settings, restricted_areas, storage_policy, system_metrics  # noqa: F401 - đăng ký model vào Base.metadata
 from app.services.identity_plate_service import identity_plate_service
 from app.services.parking_lot_service import parking_lot_service
 from app.services.plate_white_list_service import plate_white_list_service
@@ -46,6 +46,48 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE parking_lot "
             "ADD COLUMN IF NOT EXISTS face_confidence DOUBLE PRECISION "
             "NOT NULL DEFAULT 0.15"
+        )
+        # Hai loại dữ liệu mới vào danh sách tự dọn (khẩu trang + chuyển động).
+        # Bãi đang chạy đã có hàng id=1 nên INSERT ở trên không đụng tới, phải
+        # ALTER thì cột mới xuất hiện với đúng giá trị mặc định.
+        for column in ("w_event_mask", "w_motion_event"):
+            await conn.exec_driver_sql(
+                f"ALTER TABLE storage_policy "
+                f"ADD COLUMN IF NOT EXISTS {column} DOUBLE PRECISION "
+                f"NOT NULL DEFAULT 4"
+            )
+        # Cụm cổng của nhánh whitelist/barrier. Bảng plate_gate_group do
+        # create_all ở trên tạo, nhưng create_all KHÔNG thêm cột vào bảng đã
+        # tồn tại nên cột trỏ tới cụm phải tự ALTER.
+        #
+        # DROP cột `gate_group` (VARCHAR) của bản trước: khi ấy cụm chỉ là một
+        # cái nhãn gõ tay, nên cụm gồm camera chờ 30s và camera chờ 20s thì
+        # không có câu trả lời đúng nào cho "chờ bao lâu". Giờ cụm là một bảng
+        # có thời gian chờ của chính nó.
+        await conn.exec_driver_sql(
+            "ALTER TABLE IF EXISTS plate_white_list_settings "
+            "DROP COLUMN IF EXISTS gate_group"
+        )
+        await conn.exec_driver_sql(
+            "ALTER TABLE IF EXISTS plate_white_list_settings "
+            "ADD COLUMN IF NOT EXISTS gate_group_id INTEGER"
+        )
+        # Ảnh khung hình của sự kiện chuyển động. Bảng motion_events do engine
+        # C++ tạo (sql/init.sql) nên create_all ở trên không biết
+        # tới nó — cột phải tự thêm ở đây, và phải chịu được lúc engine chưa
+        # từng chạy trên máy này.
+        await conn.exec_driver_sql(
+            "ALTER TABLE IF EXISTS motion_events "
+            "ADD COLUMN IF NOT EXISTS image_path TEXT NOT NULL DEFAULT ''"
+        )
+        # Hạn lưu theo NGÀY của từng camera (0 = không giới hạn). Sống trên
+        # bảng `cameras` của engine chứ không ở bảng riêng: camera bị xoá là
+        # hạn của nó biến mất theo, không để lại hàng mồ côi. Engine C++ liệt
+        # kê cột tường minh trong mọi câu SELECT/INSERT nên cột này vô hình với
+        # nó — chỉ bộ dọn của Python đọc.
+        await conn.exec_driver_sql(
+            "ALTER TABLE IF EXISTS cameras "
+            "ADD COLUMN IF NOT EXISTS retention_days INTEGER NOT NULL DEFAULT 0"
         )
     # Prime the plate whitelist cache before the ALPR consumer thread
     # starts so the very first detection can hit the in-memory map.

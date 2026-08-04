@@ -52,7 +52,11 @@ class TaskStorageCleanup:
                             f"{k}:{v / (1024 ** 3):.2f}GB"
                             for k, v in stats.per_category.items()
                         )
-                        print(f"[storage] da xoa {stats.deleted_rows} hang, "
+                        # Nói rõ bao nhiêu hàng mất vì HẠN NGÀY: hai luật xoá
+                        # cùng một bảng, gộp số lại thì không lần ra vì sao.
+                        why = (f", trong do {stats.retention_rows} do het han luu"
+                               if stats.retention_rows else "")
+                        print(f"[storage] da xoa {stats.deleted_rows} hang{why}, "
                               f"giai phong {gb:.2f}GB ({parts})")
                 except Exception as e:
                     print(f"[storage] cycle error: {e}")

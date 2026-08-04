@@ -40,19 +40,29 @@ class StoragePolicy(Base):
 
     # Trọng số giữ lại (%). Tổng nên = 100. Mặc định: record chiếm phần lớn.
     w_record: Mapped[float] = mapped_column(
-        Float, nullable=False, default=60.0, server_default=text("60")
+        Float, nullable=False, default=56.0, server_default=text("56")
     )
     w_event_face: Mapped[float] = mapped_column(
-        Float, nullable=False, default=12.0, server_default=text("12")
+        Float, nullable=False, default=11.0, server_default=text("11")
     )
     w_event_plate: Mapped[float] = mapped_column(
-        Float, nullable=False, default=12.0, server_default=text("12")
+        Float, nullable=False, default=11.0, server_default=text("11")
     )
     w_parking_lot_event: Mapped[float] = mapped_column(
-        Float, nullable=False, default=8.0, server_default=text("8")
+        Float, nullable=False, default=7.0, server_default=text("7")
     )
     w_restricted_area: Mapped[float] = mapped_column(
-        Float, nullable=False, default=8.0, server_default=text("8")
+        Float, nullable=False, default=7.0, server_default=text("7")
+    )
+    # Hai loại vào sau. Ảnh của chúng nhỏ (một khung 640px, không có video),
+    # nên phần được giữ ít hơn — nhưng vẫn là NÚM CHỈNH ĐƯỢC, khác hẳn bản
+    # trước: chuyển động khi ấy dọn theo tuổi thọ của bản ghi, còn khẩu trang
+    # thì chẳng dọn gì vì không có bảng nào.
+    w_event_mask: Mapped[float] = mapped_column(
+        Float, nullable=False, default=4.0, server_default=text("4")
+    )
+    w_motion_event: Mapped[float] = mapped_column(
+        Float, nullable=False, default=4.0, server_default=text("4")
     )
 
     updated_at: Mapped[int] = mapped_column(

@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -30,6 +32,12 @@ class PlateWhiteListSettingsUpdate(BaseModel):
         0.5, gt=0, le=10,
         description="Độ dài xung mở barrier (giây).",
     )
+    gate_group_id: Optional[int] = Field(
+        None,
+        description="ID CỤM CỔNG mà camera thuộc về (tab Cụm cổng). Khi "
+                    "thuộc cụm, thời gian chờ lấy của CỤM và 'pre_time' ở "
+                    "trên KHÔNG còn tác dụng. null = camera đứng riêng.",
+    )
 
 
 class PlateWhiteListSettingsResponse(BaseModel):
@@ -41,3 +49,4 @@ class PlateWhiteListSettingsResponse(BaseModel):
     ocr_confidence: float
     min_plate_length: int
     barrier_duration: float
+    gate_group_id: Optional[int] = None

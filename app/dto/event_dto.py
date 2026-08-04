@@ -25,37 +25,34 @@ class _WithBox(BaseModel):
         }
 
 
-class EventPlateResponse(_WithBox):
+class AiEventResponse(_WithBox):
+    """Các trường mà sự kiện AI nào cũng trả về — đối xứng với AiEventMixin
+    bên models. Lớp con chỉ khai thêm cái riêng của mình."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     camera_id: str
-    plate_number: str
     confidence: float
     timestamp: int
     image_full: Optional[str] = None
     image_crop: Optional[str] = None
 
 
-class EventFaceResponse(_WithBox):
-    model_config = ConfigDict(from_attributes=True)
+class EventPlateResponse(AiEventResponse):
+    plate_number: str
 
-    id: int
-    camera_id: str
+
+class EventFaceResponse(AiEventResponse):
     identity_id: Optional[int] = None
     name: Optional[str] = None
-    confidence: float
-    timestamp: int
-    image_full: Optional[str] = None
-    image_crop: Optional[str] = None
 
 
-class RestrictedAreaResponse(_WithBox):
-    model_config = ConfigDict(from_attributes=True)
+class RestrictedAreaResponse(AiEventResponse):
+    pass
 
-    id: int
-    camera_id: str
-    confidence: float
-    timestamp: int
-    image_full: Optional[str] = None
-    image_crop: Optional[str] = None
+
+class EventMaskResponse(AiEventResponse):
+    # "wearing_mask" | "not_wearing_mask" | "unknown"
+    mask_status: str
+    track_id: Optional[int] = None

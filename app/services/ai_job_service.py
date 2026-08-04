@@ -63,6 +63,11 @@ class AIJobService:
     def _to_ratio(value: float) -> float:
         return value / 100.0 if value > 1 else value
 
+    # Trường chỉ dùng ở phía Python, KHÔNG gửi sang engine: engine không biết
+    # gì về chúng và cũng không cần biết. `polygons` thì quá dài, đã có bảng
+    # ai_configs giữ.
+    _PYTHON_ONLY_FIELDS = {"polygons", "saveDetections"}
+
     async def upsert(self, db: AsyncSession, req, spec: AIJobSpec, extra_data=None):
         req.primaryConf = self._to_ratio(req.primaryConf)
         req.secondaryConf = self._to_ratio(req.secondaryConf)
@@ -73,7 +78,7 @@ class AIJobService:
         if existing:
             ai_models = await HTTPXClient.get("/ai-models")
             payload = req.model_dump(exclude_none=True,
-                                     exclude={"polygons", "saveDetections"})
+                                     exclude=self._PYTHON_ONLY_FIELDS)
             payload["primaryConf"] = 0.2
             payload["secondaryConf"] = 0.2
             payload["modelPath"] = self._get_path(ai_models, spec.model_file_1)
@@ -86,7 +91,7 @@ class AIJobService:
             data = await HTTPXClient.put(f"/ai-jobs/{existing['id']}", json=payload)
         else:
             ai_models = await HTTPXClient.get("/ai-models")
-            payload = req.model_dump(exclude={"polygons", "saveDetections"})
+            payload = req.model_dump(exclude=self._PYTHON_ONLY_FIELDS)
             payload["modelPath"] = self._get_path(ai_models, spec.model_file_1)
             payload["modelPath2"] = self._get_path(ai_models, spec.model_file_2)
             payload["modelType"] = spec.model_type_1

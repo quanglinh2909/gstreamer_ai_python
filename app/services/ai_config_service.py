@@ -24,6 +24,7 @@ class AIConfigService:
         """
         jobs = await HTTPXClient.get("/ai-jobs")
         job_type_map = await AIRepository.get_job_type_map(db)
+        motion_cameras, motion_recording = await self._motion_counts()
 
         by_type = {t.value: 0 for t in TypeConfigAiEnum}
         for job in jobs or []:
@@ -37,7 +38,35 @@ class AIConfigService:
                 continue  # truly unknown job — don't invent a bucket
             by_type[job_type] = by_type.get(job_type, 0) + 1
 
-        return {"total": sum(by_type.values()), "by_type": by_type}
+        return {
+            "total": sum(by_type.values()),
+            "by_type": by_type,
+            "motion_cameras": motion_cameras,
+            "motion_recording_cameras": motion_recording,
+        }
+
+    @staticmethod
+    async def _motion_counts() -> tuple:
+        """(số camera bật phát hiện chuyển động, trong đó bao nhiêu đang ghi
+        theo chuyển động).
+
+        Đọc từ engine chứ không từ DB của Python: cấu hình chuyển động thuộc về
+        bảng cameras của engine, và engine là nơi duy nhất biết chắc camera nào
+        đang thật sự chạy với cấu hình nào.
+
+        Engine không trả lời được thì trả (0, 0) chứ không ném lỗi: cả thẻ
+        thống kê AI sẽ mất chỉ vì một con số phụ là quá đắt.
+        """
+        try:
+            cameras = await HTTPXClient.get("/cameras")
+        except Exception:
+            return 0, 0
+        enabled = [c for c in (cameras or []) if c.get("motionEnabled")]
+        recording = [
+            c for c in enabled
+            if c.get("recordingEnabled") and c.get("recordingMode") == "motion"
+        ]
+        return len(enabled), len(recording)
 
 
 ai_config_service = AIConfigService()

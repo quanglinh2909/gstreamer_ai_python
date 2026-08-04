@@ -1,12 +1,31 @@
 # -*- coding: utf-8 -*-
-"""Dọn dung lượng theo mô hình GIỮ TỐI THIỂU N GB TRỐNG (xem storage_policy.py).
+"""Dọn dung lượng. HAI luật chạy song song, mỗi luật trả lời một câu hỏi khác:
 
-Chạy định kỳ (task_storage_cleanup): mỗi lần đo chỗ trống THẬT của ổ; nếu trống
-< min_free_gb thì xoá dữ liệu CŨ NHẤT của 5 loại — ưu tiên loại đang vượt phần
-được-giữ theo trọng số — cho tới khi trống ≥ target_free_gb hoặc hết dữ liệu.
+1. HẠN LƯU THEO NGÀY, riêng từng camera (`cameras.retention_days`) — chạy MỌI
+   chu kỳ, không cần đĩa đầy. "Camera này chỉ giữ 7 ngày" là một lời hứa với
+   người dùng, không phải phương án chữa cháy: ổ 8TB không bao giờ đầy thì
+   luật (2) không bao giờ chạy và dữ liệu nằm lại vĩnh viễn.
+   Vì luật này chỉ đọc DB nên nó vẫn dọn được camera ĐÃ TẮT GHI HÌNH, thậm chí
+   camera đã ngắt kết nối — thứ mà một luật gắn vào luồng ghi không làm được.
+
+2. GIỮ TỐI THIỂU N GB TRỐNG (xem storage_policy.py) — chỉ chạy khi chỗ trống
+   THẬT của ổ tụt dưới min_free_gb, rồi xoá dữ liệu CŨ NHẤT của 7 loại (ưu tiên
+   loại đang vượt phần được-giữ theo trọng số) cho tới khi trống ≥
+   target_free_gb hoặc hết dữ liệu.
+
+Hai luật KHÔNG mâu thuẫn nhau vì cả hai chỉ biết xoá: (1) đặt trần TUỔI, (2)
+đặt trần DUNG LƯỢNG. Đĩa đầy thì (2) vẫn cắt vào dữ liệu còn trong hạn — tức là
+hạn lưu theo ngày là mức TỐI ĐA được giữ, không phải mức tối thiểu được đảm bảo.
 
 Xoá cả FILE trên đĩa lẫn HÀNG trong DB. Recording đang ghi dở (status khác
 'complete' hoặc mới < 3 phút) TUYỆT ĐỐI không đụng tới.
+
+Chuyển động và khẩu trang giờ cũng nằm trong danh sách này. Trước đây chúng
+đứng ngoài vì mỗi loại thiếu một nửa: khẩu trang không có bảng, chuyển động
+không có file — nên chuyển động phải dọn bằng một luật riêng ("đoạn ghi chứa nó
+đã bị xoá thì xoá theo"). Luật đó gắn tuổi thọ của sự kiện vào tuổi thọ của
+video, tức là người dùng không hề chỉnh được nó ở đâu. Giờ cả hai đều có bảng
+lẫn ảnh, nên chúng dọn theo TỶ TRỌNG như mọi loại khác.
 """
 
 import os
@@ -32,6 +51,10 @@ GSTREAMER_C_DIR = os.environ.get(
     os.path.join(os.path.dirname(_REPO_DIR), "gstreamer_c"),
 )
 RECORDINGS_DIR = os.path.join(GSTREAMER_C_DIR, "recordings")
+# Ảnh khung hình của sự kiện chuyển động, do engine C++ ghi. Nằm cạnh
+# recordings/ chứ không nằm trong (xem StreamTypes.hpp::motionSnapshotDir), để
+# `du` đo được tách bạch hai loại.
+MOTION_SNAPSHOTS_DIR = os.path.join(GSTREAMER_C_DIR, "motion-snapshots")
 
 
 @dataclass
@@ -44,6 +67,14 @@ class Category:
     file_cols: List[str]       # (các) cột chứa đường dẫn/URL file
     file_kind: str             # "uploads" | "recording"
     where: str = ""            # điều kiện WHERE thêm (an toàn)
+    # Kiểu của order_col, để tính TUỔI cho hạn-lưu-theo-ngày. Hai backend viết
+    # thời gian theo hai kiểu khác nhau và không có ý định gộp: engine C++ dùng
+    # timestamptz, còn các bảng sự kiện của Python dùng epoch giây (integer).
+    time_kind: str = "epoch"   # "epoch" | "tstz"
+    # (Các) cột chỉ tới camera sở hữu hàng. Rỗng = loại này đứng ngoài hạn lưu
+    # theo camera. Nhiều cột (bãi xe: mặt + biển) thì hàng chỉ hết hạn khi ĐÃ
+    # quá hạn của MỌI camera liên quan — xem _retention_clauses.
+    camera_cols: List[str] = field(default_factory=list)
 
 
 CATEGORIES: List[Category] = [
@@ -53,30 +84,52 @@ CATEGORIES: List[Category] = [
         order_col="start_at", file_cols=["path"], file_kind="recording",
         # Không đụng đoạn đang ghi / vừa đóng chưa chắc chắn.
         where="status = 'complete' AND start_at < now() - interval '3 minutes'",
+        time_kind="tstz", camera_cols=["camera_id"],
     ),
     Category(
         key="event_face", weight_field="w_event_face",
         directory=os.path.join(UPLOADS_ROOT, "faces"), table="event_face",
         order_col="timestamp", file_cols=["image_full", "image_crop"],
-        file_kind="uploads",
+        file_kind="uploads", camera_cols=["camera_id"],
     ),
     Category(
         key="event_plate", weight_field="w_event_plate",
         directory=os.path.join(UPLOADS_ROOT, "plates"), table="event_plates",
         order_col="timestamp", file_cols=["image_full", "image_crop"],
-        file_kind="uploads",
+        file_kind="uploads", camera_cols=["camera_id"],
     ),
     Category(
         key="parking_lot_event", weight_field="w_parking_lot_event",
         directory=os.path.join(UPLOADS_ROOT, "parking"), table="parking_lot_event",
         order_col="timestamp", file_cols=["face_image_full", "plate_image_full"],
         file_kind="uploads",
+        # Một sự kiện bãi xe thuộc về HAI camera. Xoá nó theo hạn của riêng
+        # camera mặt là xoá luôn bằng chứng của camera biển số còn trong hạn.
+        camera_cols=["face_camera_id", "plate_camera_id"],
     ),
     Category(
         key="restricted_area", weight_field="w_restricted_area",
         directory=os.path.join(UPLOADS_ROOT, "restricted"), table="restricted_areas",
         order_col="timestamp", file_cols=["image_full", "image_crop"],
-        file_kind="uploads",
+        file_kind="uploads", camera_cols=["camera_id"],
+    ),
+    Category(
+        key="event_mask", weight_field="w_event_mask",
+        directory=os.path.join(UPLOADS_ROOT, "masks"), table="event_mask",
+        order_col="timestamp", file_cols=["image_full", "image_crop"],
+        file_kind="uploads", camera_cols=["camera_id"],
+    ),
+    Category(
+        # Sự kiện chuyển động: ảnh do engine C++ ghi nên đường dẫn tương đối
+        # với gstreamer_c/ (giống recording), không phải /uploads.
+        key="motion_event", weight_field="w_motion_event",
+        directory=MOTION_SNAPSHOTS_DIR, table="motion_events",
+        order_col="start_at", file_cols=["image_path"],
+        file_kind="recording",
+        # Sự kiện vừa xảy ra có thể chưa kịp ghi xong ảnh (engine chèn hàng lúc
+        # sự kiện KẾT THÚC, ảnh chụp lúc nó BẮT ĐẦU). Chừa một khoảng an toàn.
+        where="start_at < now() - interval '3 minutes'",
+        time_kind="tstz", camera_cols=["camera_id"],
     ),
 ]
 
@@ -121,14 +174,19 @@ class _RunStats:
     freed_bytes: int = 0
     deleted_rows: int = 0
     per_category: dict = field(default_factory=dict)
+    # Bao nhiêu hàng trong deleted_rows là do HẠN NGÀY (chứ không do đĩa đầy).
+    # Tách ra để log nói được vì sao dữ liệu biến mất — hai luật xoá cùng một
+    # bảng, không tách thì không lần ra được nguyên nhân.
+    retention_rows: int = 0
 
 
 class StorageCleanupService:
     async def _load_policy(self, session: AsyncSession):
+        # Cột trọng số lấy thẳng từ CATEGORIES: thêm một loại chỉ còn phải sửa
+        # đúng một chỗ (danh sách ở trên) thay vì nhớ sửa cả câu SELECT này.
+        weights = ", ".join(c.weight_field for c in CATEGORIES)
         row = (await session.execute(text(
-            "SELECT enabled, min_free_gb, target_free_gb, "
-            "w_record, w_event_face, w_event_plate, "
-            "w_parking_lot_event, w_restricted_area "
+            f"SELECT enabled, min_free_gb, target_free_gb, {weights} "
             "FROM storage_policy WHERE id = 1"
         ))).mappings().first()
         return row
@@ -141,14 +199,31 @@ class StorageCleanupService:
             return {k: 1.0 / len(raw) for k in raw}
         return {k: v / s for k, v in raw.items()}
 
-    async def _delete_batch(self, session: AsyncSession, cat: Category, n: int):
-        """Xoá n hàng CŨ NHẤT của một loại (kèm file). Trả (bytes, số hàng)."""
-        where = f"WHERE {cat.where}" if cat.where else ""
-        cols = ", ".join(cat.file_cols)
+    async def _delete_batch(
+        self,
+        session: AsyncSession,
+        cat: Category,
+        n: int,
+        *,
+        cte: str = "",
+        join: str = "",
+        extra_where: str = "",
+        params: dict = None,
+    ):
+        """Xoá n hàng CŨ NHẤT của một loại (kèm file). Trả (bytes, số hàng).
+
+        cte/join/extra_where để lượt HẠN NGÀY gắn thêm bảng hạn của từng camera
+        vào cùng một câu lệnh; lượt đĩa-đầy gọi không kèm gì và ra đúng câu lệnh
+        như trước.
+        """
+        conds = [c for c in (cat.where, extra_where) if c]
+        where = ("WHERE " + " AND ".join(f"({c})" for c in conds)) if conds else ""
+        cols = ", ".join(f"t.{c}" for c in cat.file_cols)
+        args = {"n": n, **(params or {})}
         rows = (await session.execute(text(
-            f"SELECT CAST(id AS text) AS id, {cols} FROM {cat.table} "
-            f"{where} ORDER BY {cat.order_col} ASC LIMIT :n"
-        ), {"n": n})).mappings().all()
+            f"{cte} SELECT CAST(t.id AS text) AS id, {cols} FROM {cat.table} t {join} "
+            f"{where} ORDER BY t.{cat.order_col} ASC LIMIT :n"
+        ), args)).mappings().all()
         if not rows:
             return 0, 0
 
@@ -173,8 +248,102 @@ class StorageCleanupService:
         await session.commit()
         return freed, len(ids)
 
+    # ---------- Luật 1: hạn lưu theo NGÀY, riêng từng camera ----------
+
+    async def _load_retentions(self, session: AsyncSession) -> List[dict]:
+        """{id, retention_days} của các camera CÓ đặt hạn (days > 0).
+
+        Chịu được máy chưa từng chạy engine C++: bảng `cameras` do engine tạo
+        (sql/001_init_cameras.sql) chứ không phải create_all của Python, nên
+        thiếu bảng/thiếu cột là chuyện bình thường, không phải lỗi.
+        """
+        try:
+            rows = (await session.execute(text(
+                "SELECT CAST(id AS text) AS id, retention_days FROM cameras "
+                "WHERE retention_days > 0"
+            ))).mappings().all()
+            return [dict(r) for r in rows]
+        except Exception:
+            await session.rollback()
+            return []
+
+    def _retention_clauses(self, cat: Category):
+        """(join, where) cho hạn ngày. `r(cam, days)` do run_retention dựng.
+
+        Một hàng HẾT HẠN khi: mọi cột camera có giá trị đều tra được trong r,
+        có ít nhất một cột tra được, và hàng đã già hơn hạn LỚN NHẤT trong số
+        đó. LEFT JOIN + đòi `days IS NOT NULL` là cách nói "camera nào không
+        đặt hạn thì giữ vô thời hạn" — dùng INNER JOIN sẽ im lặng bỏ sót,
+        còn bỏ điều kiện đó đi thì sự kiện bãi xe bị camera này xoá mất phần
+        của camera kia.
+        """
+        joins, guards, days = [], [], []
+        for i, col in enumerate(cat.camera_cols):
+            key = f"nullif(CAST(t.{col} AS text), '')"
+            joins.append(f"LEFT JOIN r r{i} ON {key} = r{i}.cam")
+            guards.append(f"({key} IS NULL OR r{i}.days IS NOT NULL)")
+            days.append(f"r{i}.days")
+        # greatest() bỏ qua NULL, nên cột camera trống không kéo hạn về 0.
+        max_days = f"greatest({', '.join(f'coalesce({d}, 0)' for d in days)})"
+        cutoff = f"now() - make_interval(days => {max_days})"
+        if cat.time_kind == "epoch":
+            cutoff = f"extract(epoch from {cutoff})"
+        guards.append(f"coalesce({', '.join(days)}) IS NOT NULL")
+        guards.append(f"t.{cat.order_col} < {cutoff}")
+        return " ".join(joins), " AND ".join(guards)
+
+    async def run_retention(self, session: AsyncSession, stats: _RunStats = None) -> _RunStats:
+        """Xoá mọi thứ đã quá hạn lưu của camera sở hữu nó.
+
+        KHÔNG phụ thuộc storage_policy.enabled và không nhìn chỗ trống của ổ:
+        hạn lưu là lời hứa "chỉ giữ N ngày", còn công tắc kia chỉ nói về chuyện
+        chữa cháy khi đĩa sắp đầy. Cũng KHÔNG phụ thuộc camera có đang ghi hay
+        đang kết nối không — lượt này chỉ đọc DB.
+        """
+        stats = stats or _RunStats()
+        cams = await self._load_retentions(session)
+        if not cams:
+            return stats
+
+        params = {}
+        values = []
+        for i, cam in enumerate(cams):
+            params[f"c{i}"] = cam["id"]
+            params[f"d{i}"] = int(cam["retention_days"])
+            values.append(f"(CAST(:c{i} AS text), CAST(:d{i} AS int))")
+        cte = f"WITH r(cam, days) AS (VALUES {', '.join(values)})"
+
+        for cat in CATEGORIES:
+            if not cat.camera_cols:
+                continue
+            join, where = self._retention_clauses(cat)
+            guard = 0
+            while guard < 500:  # trần 100k hàng/loại/chu kỳ, đủ để không treo
+                guard += 1
+                try:
+                    freed, ndel = await self._delete_batch(
+                        session, cat, _BATCH,
+                        cte=cte, join=join, extra_where=where, params=params,
+                    )
+                except Exception as exc:
+                    await session.rollback()
+                    print(f"[storage] han luu {cat.key} loi: {exc}")
+                    traceback.print_exc()
+                    break
+                if ndel == 0:
+                    break
+                stats.freed_bytes += freed
+                stats.deleted_rows += ndel
+                stats.retention_rows += ndel
+                stats.per_category[cat.key] = stats.per_category.get(cat.key, 0) + freed
+        return stats
+
+    # ---------- Luật 2: giữ tối thiểu N GB trống ----------
+
     async def run_once(self, session: AsyncSession) -> _RunStats:
-        stats = _RunStats()
+        # Hạn ngày chạy TRƯỚC và luôn chạy: dọn xong phần quá hạn rồi mới đo
+        # chỗ trống, nhờ vậy nhiều hôm không phải đụng tới dữ liệu còn trong hạn.
+        stats = await self.run_retention(session)
         policy = await self._load_policy(session)
         if not policy or not policy["enabled"]:
             return stats

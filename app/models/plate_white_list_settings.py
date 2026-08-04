@@ -1,3 +1,5 @@
+from typing import Optional
+
 from sqlalchemy import String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -63,6 +65,26 @@ class PlateWhiteListSettings(Base):
         nullable=False, server_default=text("0.5")
     )
 
+    # CỤM CỔNG mà camera này thuộc về (plate_gate_group.id). NULL = đứng
+    # riêng, dùng `pre_time` ở trên như trước.
+    #
+    # Vì sao cần: mặc định `pre_time` chỉ chặn chính camera vừa đọc, và đó là
+    # CỐ Ý — cổng vào và cổng ra là hai camera khác nhau, xe vừa vào không
+    # được vì thế mà bị khoá ở cổng ra. Nhưng một làn vừa vào vừa ra thì hai
+    # camera cùng nhìn MỘT barrier: xe chạy qua camera 1 mở cổng, chạy tiếp
+    # qua camera 2 lại mở lần nữa, xung mở nối nhau nên barrier không kịp
+    # đóng. Xếp hai camera đó vào cùng một cụm thì chúng dùng chung một đồng
+    # hồ chờ và lần đọc thứ hai bị chặn.
+    #
+    # Khi thuộc cụm, thời gian chờ lấy của CỤM (plate_gate_group.pre_time),
+    # không phải `pre_time` của camera — xem plate_gate_group.py.
+    #
+    # Không đặt ForeignKey: cụm bị xoá thì router tự gỡ camera khỏi cụm, và
+    # bảng này còn phải sống được trên máy chưa từng có bảng cụm.
+    gate_group_id: Mapped[Optional[int]] = mapped_column(
+        nullable=True, server_default=text("NULL")
+    )
+
 
 # Các cột ngưỡng (tách khỏi camera_id) — dùng chung cho DTO, repository và
 # cache để thêm cột mới chỉ phải sửa một chỗ.
@@ -72,4 +94,5 @@ PLATE_WHITE_LIST_SETTING_FIELDS = (
     "ocr_confidence",
     "min_plate_length",
     "barrier_duration",
+    "gate_group_id",
 )

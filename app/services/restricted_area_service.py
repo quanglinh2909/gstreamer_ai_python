@@ -216,50 +216,19 @@ class RestrictedAreaService(AIServiceBase):
     CROP_OUTPUT_W = 400
     CROP_OUTPUT_H = 480
 
+    # Lưu ảnh + hàng + WebSocket + đánh thức ghi hình: toàn bộ nằm ở
+    # AIServiceBase.save_event. Ở đây chỉ còn cái RIÊNG của vùng cấm —
+    # class_id đi kèm gói realtime (chưa có cột trong bảng) để giao diện đặt
+    # nhãn khác nhau cho từng lớp YOLO.
+    EVENT_MODEL = RestrictedArea
+    EVENT_BROADCASTER = restricted_area_event_broadcaster
+    EVENT_SOURCE = "restricted_area"
+
     async def _persist_event(self, meta, parent, full_jpeg, tid, timestamp):
-        from app.services.process_ai_service import process_ai_service
-        session_factory = process_ai_service._session_factory
-        if session_factory is None:
-            return
-        try:
-            paths = await asyncio.to_thread(
-                self._save_images_blocking, full_jpeg, meta, parent, tid,
-            )
-            if paths is None:
-                return
-            full_url, crop_url, box = paths
-            async with session_factory() as db:
-                event = RestrictedArea(
-                    camera_id=str(meta["cameraId"]),
-                    confidence=float(parent.get("score", 0.0)),
-                    timestamp=int(timestamp),
-                    image_full=full_url,
-                    image_crop=crop_url,
-                    box_x1=box["x1"] if box else None,
-                    box_y1=box["y1"] if box else None,
-                    box_x2=box["x2"] if box else None,
-                    box_y2=box["y2"] if box else None,
-                )
-                db.add(event)
-                await db.commit()
-            # expire_on_commit=False on the session_factory keeps
-            # event.id populated after commit without an extra refresh.
-            # class_id isn't persisted yet (would need a schema bump),
-            # but the detection's class id is already in `parent` so we
-            # forward it on the WS frame — handy for the UI to render
-            # different labels per YOLO class.
-            restricted_area_event_broadcaster.publish({
-                "id": event.id,
-                "camera_id": event.camera_id,
-                "class_id": parent.get("classId"),
-                "confidence": float(event.confidence),
-                "timestamp": int(event.timestamp),
-                "image_full": event.image_full,
-                "image_crop": event.image_crop,
-                "box": box,
-            })
-        except Exception as exc:
-            print(f"restricted-area persist error: {exc}", file=sys.stderr)
+        await self.save_event(
+            meta, parent, full_jpeg, tid, timestamp,
+            payload={"class_id": parent.get("classId")},
+        )
 
     @staticmethod
     def _voice_call_blocking(camera_id: str) -> None:
