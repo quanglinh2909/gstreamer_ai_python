@@ -25,7 +25,6 @@ class CameraCreateDTO(BaseModel):
     preMotionSeconds: int = 5
     postMotionSeconds: int = 5
     segmentSeconds: int = 60
-    motionKeyframeOnly: bool = False
     # Lưới phát hiện chuyển động theo ô (motioncells chỉ nhận 8..32).
     motionGridX: int = 32
     motionGridY: int = 32
@@ -53,7 +52,6 @@ class CameraUpdateDTO(BaseModel):
     preMotionSeconds: Optional[int] = None
     postMotionSeconds: Optional[int] = None
     segmentSeconds: Optional[int] = None
-    motionKeyframeOnly: Optional[bool] = None
     motionGridX: Optional[int] = None
     motionGridY: Optional[int] = None
     motionCellLevels: Optional[str] = None
