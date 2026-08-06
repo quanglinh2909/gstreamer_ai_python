@@ -24,6 +24,7 @@ from app.services.identity_plate_service import identity_plate_service
 from app.services.parking_lot_service import parking_lot_service
 from app.services.plate_white_list_service import plate_white_list_service
 from app.services.plate_white_list_settings_service import plate_white_list_settings_service
+from app.moq.server import moq_server
 from app.tasks.task_parking_lot import task_parking_lot
 from app.tasks.task_storage_cleanup import task_storage_cleanup
 from app.tasks.task_system_metrics import task_system_metrics
@@ -108,10 +109,14 @@ async def lifespan(app: FastAPI):
     # Tự dọn dung lượng: giữ tối thiểu N GB trống, xoá dữ liệu cũ khi cần.
     threading.Thread(target=task_storage_cleanup.worker, daemon=True).start()
     threading.Thread(target=play_sound.play_sound, daemon=True).start()
+    # Duong xem thu hai: MoQ tren QUIC/WebTransport, song song WebRTC. Chay
+    # event loop RIENG de mot nguoi xem mang cham khong lam cham REST/WS.
+    threading.Thread(target=moq_server.worker, daemon=True).start()
     yield
     process_ai_service.stop()
     task_system_metrics.stop()
     task_storage_cleanup.stop()
+    moq_server.stop()
     close_client()
 
 

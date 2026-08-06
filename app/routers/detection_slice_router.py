@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """Truy xuất khung phát hiện đã lưu: vẽ lại khi XEM LẠI, và TÌM theo vùng vẽ.
 
-Hai đầu vào khác nhau nhưng cùng một bảng và cùng một chỉ mục
+Hai đầu vào đầu dùng chung bảng `detection_slice` và chỉ mục
 (camera_id, t_start) — xem app/models/detection_slice.py.
+
+Tìm theo vùng còn quét THÊM bảng `motion_events` (engine C++ ghi) và trả kết
+quả chuyển động trong CÙNG một danh sách, gắn `ai_type="motion"`. Hai nguồn này
+không gộp được ở tầng SQL: một bên là track có bbox trên lưới 16×16 cố định,
+bên kia là tập ô trên lưới riêng của từng camera.
 """
 
 import struct
@@ -10,7 +15,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -24,6 +29,12 @@ GRID = 16
 # Trần số lát trả về một lần. Một camera ~26k lát/ngày, nên phải chặn để một
 # yêu cầu khoảng thời gian rộng không kéo cả ngày về trình duyệt.
 MAX_SLICES = 4000
+# Sự kiện chuyển động thưa hơn lát AI rất nhiều (một sự kiện kéo dài vài giây
+# thay vì một lát mỗi 2 giây cho MỖI vật thể), nên trần thấp hơn là đủ.
+MAX_MOTION_EVENTS = 2000
+# `ai_type` quy ước cho chuyển động. KHÔNG phải một loại AI thật — nó không đi
+# qua model nào — nhưng dùng chung ô này để kết quả trộn được vào một danh sách.
+MOTION_TYPE = "motion"
 
 
 class SampleDTO(BaseModel):
@@ -168,6 +179,14 @@ class RegionHitDTO(BaseModel):
     best_score: Optional[float]
     # bbox hợp của phần track nằm trong khoảng — để hiện ảnh xem trước.
     bbox: List[float]
+    # ---- Chỉ có ở kết quả CHUYỂN ĐỘNG (lát AI để trống) ----
+    # Id hàng motion_events: giao diện dùng nó để lấy đúng ảnh engine đã chụp
+    # lúc sự kiện bắt đầu, thay vì trích lại thumbnail từ bản ghi.
+    event_id: Optional[str] = None
+    # Ô đã động + cỡ lưới CỦA CHÍNH sự kiện, để vẽ lớp phủ giống bảng sự kiện.
+    cells: Optional[str] = None
+    grid_x: Optional[int] = None
+    grid_y: Optional[int] = None
 
 
 @router.get("/region-search", response_model=List[RegionHitDTO])
@@ -179,7 +198,8 @@ async def region_search(
     y1: float = Query(..., ge=0, le=1),
     x2: float = Query(..., ge=0, le=1),
     y2: float = Query(..., ge=0, le=1),
-    ai_type: Optional[str] = Query(None),
+    ai_type: Optional[str] = Query(
+        None, description='Lọc một loại; "motion" = chỉ sự kiện chuyển động'),
     gap_ms: int = Query(5000, description="Cách nhau quá lâu thì tách sự kiện"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -191,7 +211,11 @@ async def region_search(
       3. AND lưới 16×16 (32 byte) — bbox là bao lồi nên người đi chéo màn hình
          khớp cả những vùng họ chưa từng bước vào; tầng này loại chúng mà
          KHÔNG phải giải mã quỹ đạo.
-    Cuối cùng gộp các lát cùng `tid` cách nhau < gap_ms thành một sự kiện."""
+    Cuối cùng gộp các lát cùng `tid` cách nhau < gap_ms thành một sự kiện.
+
+    CHUYỂN ĐỘNG cũng tìm được ở đây (`ai_type="motion"`) nhưng đi đường riêng:
+    nó nằm ở bảng `motion_events` của engine C++, không có track/bbox mà chỉ có
+    tập ô đã động — xem `_motion_hits`."""
     if to_ms < from_ms:
         raise HTTPException(400, "to_ms phải >= from_ms")
     qx1, qx2 = min(x1, x2), max(x1, x2)
@@ -237,8 +261,88 @@ async def region_search(
         )
         hits.append(hit)
         last_by_key[key] = hit
+
+    # CHUYỂN ĐỘNG: bảng khác, đơn vị khác, nên quét riêng rồi trộn vào.
+    if not ai_type or ai_type == MOTION_TYPE:
+        hits.extend(await _motion_hits(db, camera_id, from_ms, to_ms,
+                                       qx1, qy1, qx2, qy2))
+
     # MỚI NHẤT TRƯỚC — cùng thứ tự với bảng sự kiện, người xem quét từ trên
     # xuống là đi ngược dòng thời gian. Vòng gộp ở trên VẪN cần quét tăng dần
     # (nó dựa vào việc lát sau luôn tới sau lát trước), nên chỉ đảo ở đây.
     hits.sort(key=lambda h: h.t_start, reverse=True)
     return hits
+
+
+async def _motion_hits(db: AsyncSession, camera_id: str, from_ms: int, to_ms: int,
+                       qx1: float, qy1: float, qx2: float,
+                       qy2: float) -> List[RegionHitDTO]:
+    """Sự kiện CHUYỂN ĐỘNG có ô nào chạm vùng đã khoanh.
+
+    Vì sao không dùng chung đường với AI:
+      * `motion_events` do engine C++ ghi, không có `tid` (không bám vật thể),
+        không có bbox, không có class — chỉ một tập Ô ĐÃ ĐỘNG;
+      * lưới của nó là lưới của camera (thường 32×32), khác lưới 16×16 cố định
+        mà lát AI dùng. May là mỗi hàng tự mang `grid_x/grid_y` của chính nó,
+        nên đổi độ phân giải lưới giữa chừng không làm dữ liệu cũ lệch.
+
+    Ô (r, c) phủ đúng [c/gx, (c+1)/gx] × [r/gy, (r+1)/gy] trong khung hình.
+    KHÔNG phải trừ viền letterbox: MotionDetector trải lưới trên PHẦN ẢNH THẬT
+    chứ không trên cả khung có đệm đen (xem MotionDetector::submit).
+
+    Đọc bằng SQL thô: bảng này thuộc quyền engine C++, khai báo lại thành model
+    SQLAlchemy là mời create_all() đụng vào một bảng nó không sở hữu.
+    """
+    rows = (await db.execute(
+        text(
+            "SELECT id, cells, grid_x, grid_y, image_path,"
+            "       (EXTRACT(EPOCH FROM start_at) * 1000)::bigint AS t_start,"
+            "       (EXTRACT(EPOCH FROM COALESCE(end_at, start_at)) * 1000)::bigint AS t_end"
+            "  FROM motion_events"
+            " WHERE camera_id = CAST(:cam AS uuid)"
+            "   AND start_at <= to_timestamp(:to_ms / 1000.0)"
+            "   AND COALESCE(end_at, start_at) >= to_timestamp(:from_ms / 1000.0)"
+            " ORDER BY start_at DESC LIMIT :lim"
+        ),
+        {"cam": camera_id, "from_ms": from_ms, "to_ms": to_ms,
+         "lim": MAX_MOTION_EVENTS},
+    )).mappings().all()
+
+    out: List[RegionHitDTO] = []
+    for row in rows:
+        gx = row["grid_x"] or 0
+        gy = row["grid_y"] or 0
+        if gx <= 0 or gy <= 0 or not row["cells"]:
+            continue
+        bx1 = by1 = 1.0
+        bx2 = by2 = 0.0
+        touched = False
+        for token in row["cells"].split(","):
+            r, _, c = token.partition(":")
+            try:
+                ri, ci = int(r), int(c)
+            except ValueError:
+                continue
+            cx1, cx2 = ci / gx, (ci + 1) / gx
+            cy1, cy2 = ri / gy, (ri + 1) / gy
+            # Chồng lấn THỰC SỰ (< > chứ không <= >=): vẽ đúng trên đường biên
+            # ô thì không nên tính là đã đi qua ô bên cạnh.
+            if cx1 >= qx2 or cx2 <= qx1 or cy1 >= qy2 or cy2 <= qy1:
+                continue
+            touched = True
+            bx1, by1 = min(bx1, cx1), min(by1, cy1)
+            bx2, by2 = max(bx2, cx2), max(by2, cy2)
+        if not touched:
+            continue
+        out.append(RegionHitDTO(
+            tid=None, ai_type=MOTION_TYPE, class_id=None,
+            t_start=int(row["t_start"]), t_end=int(row["t_end"]),
+            # Không có độ tin cậy thật — để trống thay vì bịa một con số.
+            best_score=None,
+            bbox=[bx1, by1, bx2, by2],
+            event_id=str(row["id"]),
+            cells=row["cells"],
+            grid_x=gx,
+            grid_y=gy,
+        ))
+    return out
