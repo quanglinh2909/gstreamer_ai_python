@@ -30,3 +30,17 @@ class AIConfig(Base):
     save_detections: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    # Có GHI sự kiện của AI này (event_plates / event_face / event_mask /
+    # sự kiện vùng cấm) xuống DB và ảnh xuống đĩa hay không. MẶC ĐỊNH BẬT —
+    # đây là hành vi đã có từ trước, tắt là một lựa chọn chứ không phải mặc định.
+    #
+    # Tắt thì luồng vẫn chạy y nguyên: vẫn phát hiện, vẫn vẽ khung lên video
+    # trực tiếp, vẫn BẮN sự kiện realtime qua WebSocket cho bảng sự kiện —
+    # chỉ không để lại gì trên đĩa lẫn trong lịch sử. Dùng cho camera chỉ cần
+    # theo dõi tại chỗ mà không cần tra cứu về sau.
+    #
+    # Theo TỪNG CAMERA và TỪNG LOẠI AI, vì mỗi hàng ai_configs là một cặp
+    # (camera, loại AI).
+    save_events: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )

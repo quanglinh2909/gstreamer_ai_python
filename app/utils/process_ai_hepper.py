@@ -10,7 +10,10 @@ from trackers import BoTSORTTracker, ByteTrackTracker, OCSORTTracker
 from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.services.face_mask_service import face_mask_service
 from app.services.face_recognition_service import face_recognition_service
-from app.services.plate_recognition_service import plate_recognition_service
+from app.services.plate_recognition import (
+    plate_handler,
+    plate_recognition_service,
+)
 from app.services.restricted_area_service import restricted_area_service
 
 
@@ -334,25 +337,48 @@ class ProcessAiHepper:
         return detections[np.isin(detections.class_id, list(class_ids))]
 
     @staticmethod
-    def get_track_class_ids(service_ai):
-        """Per-service tracking class whitelist, or None to track all."""
+    def get_track_class_ids(service_ai, extra_data=None):
+        """Lớp đưa vào tracker, hoặc None = track hết.
+
+        Lấy theo BIẾN THỂ mà camera này đang chạy chứ không phải thuộc tính
+        cố định của dịch vụ: cùng "nhận dạng biển số" nhưng biến thể chạy
+        model xe thì track xe, còn biến thể chạy model biển thì track biển."""
+        variant = ProcessAiHepper._variant(service_ai, extra_data)
+        if variant is not None:
+            return variant.track_classes
         return getattr(service_ai, "TRACK_CLASS_IDS", None)
 
     @staticmethod
-    def get_class_meta(service_ai):
+    def get_class_meta(service_ai, extra_data=None):
         """Per-service debug-overlay metadata keyed by classId, or None.
 
         Shape: {classId: {"name": str, "color": <BGR tuple | "#RRGGBB">}}.
         Both keys optional — `name` relabels the box, `color` recolors it.
         Purely cosmetic; only the debug MJPEG overlay reads it."""
+        variant = ProcessAiHepper._variant(service_ai, extra_data)
+        if variant is not None and variant.class_meta is not None:
+            return variant.class_meta
         return getattr(service_ai, "CLASS_META", None)
 
     @staticmethod
-    def get_service_ai(type: str):
+    def _variant(service_ai, extra_data):
+        getter = getattr(service_ai, "variant", None)
+        return getter(extra_data) if callable(getter) else None
+
+    @staticmethod
+    def get_service_ai(type: str, extra_data=None):
+        """Đối tượng xử lý khung hình của một AI job.
+
+        `extra_data` mang biến thể camera đang chạy: loại AI có nhiều cách làm
+        thì mỗi cách là một lớp riêng, và job được trao thẳng cho đúng lớp đó
+        thay vì một lớp chung tự rẽ nhánh ở mọi hàm. Không truyền thì trả về
+        mặt tiền của loại — đủ dùng cho những chỗ chỉ cần hỏi danh sách biến
+        thể hay lưu cấu hình."""
         if type == TypeConfigAiEnum.FACE_RECOGNITION.value:
             return face_recognition_service
         elif type == TypeConfigAiEnum.PLATE_RECOGNITION.value:
-            return plate_recognition_service
+            return (plate_handler(extra_data) if extra_data is not None
+                    else plate_recognition_service)
         elif type == TypeConfigAiEnum.RESTRICTED_AREA.value:
             return restricted_area_service
         elif type == TypeConfigAiEnum.FACE_MASK.value:

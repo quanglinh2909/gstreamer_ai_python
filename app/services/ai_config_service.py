@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.httpx_client import HTTPXClient
 from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.repositories.ai_config_repository import AIRepository
+from app.services.ai_job_service import job_transform
 
 # Fallback type for engine jobs with no AIConfig row (orphans), keyed by the
 # stage-2 transform — same mapping camera_service uses.
@@ -33,7 +34,7 @@ class AIConfigService:
             job_type = job_type_map.get(job.get("id"))
             if job_type is None:
                 # No AIConfig row — best-effort label from the transform.
-                job_type = _TRANSFORM_TO_TYPE.get(job.get("transformData"))
+                job_type = _TRANSFORM_TO_TYPE.get(job_transform(job))
             if job_type is None:
                 continue  # truly unknown job — don't invent a bucket
             by_type[job_type] = by_type.get(job_type, 0) + 1

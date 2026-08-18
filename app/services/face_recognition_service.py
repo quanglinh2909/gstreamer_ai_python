@@ -18,7 +18,7 @@ from app.models.event_face import EventFace
 from app.models.identity import Identity
 from app.repositories.event_face_repository import EventFaceRepository
 from app.repositories.face_vector_repository import FaceVectorRepository
-from app.services.ai_job_service import AIJobSpec, ai_job_service
+from app.services.ai_job_service import AIJobSpec, AIStage, AIVariant, ai_job_service
 # UPLOADS_ROOT is re-exported here: identity_service imports it from this
 # module, and it now lives with the shared crop/save helpers.
 from app.services.ai_service_base import UPLOADS_ROOT, AIServiceBase
@@ -34,15 +34,29 @@ _RESOLVED = "resolved"   # successfully identified; no more attempts
 
 FACE_SPEC = AIJobSpec(
     config_type=TypeConfigAiEnum.FACE_RECOGNITION.value,
-    transform_data="align_face",
     name="Face recognition",
-    model_file_1="yolov8_pose_face_in8.rknn",
-    model_file_2="adaface_ir101_fp16.rknn",
-    model_type_1="yolov8_pose",
-    model_type_2="face_recognition",
+    stages=(
+        # Tầng 0: tìm mặt + 5 điểm mốc trên cả khung.
+        AIStage(model_file="yolov8_pose_face_in8.rknn", model_type="yolov8_pose"),
+        # Tầng 1: nắn mặt theo điểm mốc rồi trích vector nhận dạng.
+        AIStage(model_file="adaface_ir101_fp16.rknn",
+                model_type="face_recognition", transform="align_face"),
+    ),
 )
 
+# Một cách làm duy nhất: mặt tự nó là vật được bám, không có lớp phụ nào gắn
+# vào. Vẫn khai thành biến thể để tracking/overlay đọc từ cùng một chỗ với ba
+# loại AI kia; giao diện sẽ không hiện ô chọn vì chỉ có một.
+FACE_VARIANT = AIVariant(
+    id="yolov8_pose_adaface",
+    label="YOLOv8-pose + AdaFace",
+    spec=FACE_SPEC,
+)
+
+
 class FaceRecognitionService(AIServiceBase):
+    VARIANTS = (FACE_VARIANT,)
+
     EVENT_FOLDER = "faces"
 
     # MỘT SỰ KIỆN CHO MỘT TRACK — mất track là coi như người đó đi.
@@ -307,6 +321,7 @@ class FaceRecognitionService(AIServiceBase):
         self, meta, parent, full_jpeg, tid, timestamp, secondary_conf,
         save_unmatched: bool,
         persist: bool = True,
+        extra_data=None,
     ):
         """Run identification and (optionally) write one EventFace row.
 
@@ -380,11 +395,16 @@ class FaceRecognitionService(AIServiceBase):
             columns={"identity_id": identity_id},
             payload={"identity_id": identity_id, "name": identity_name},
             confidence=similarity,
+            extra_data=extra_data,
         )
-        if event is None:
+        if event is None and self.should_save_events(extra_data):
             # Ghi ảnh hỏng -> trả None để track ở lại PENDING và khung sau thử
             # lại. Trả identity_id ở đây là track thành RESOLVED và lần xuất
             # hiện này mất luôn cả sự kiện lẫn ảnh.
+            #
+            # Camera TẮT ghi sự kiện thì save_event cũng trả None (đúng: không
+            # có hàng nào) nhưng đó là kết quả MONG MUỐN — không tách hai
+            # trường hợp thì track đứng mãi ở PENDING và khớp lại mỗi khung.
             return None
         self._written_tracks.add(write_key)
         return identity_id
@@ -393,6 +413,7 @@ class FaceRecognitionService(AIServiceBase):
         self, meta, parent, full_jpeg, tid, timestamp, secondary_conf,
         save_unmatched: bool,
         persist: bool = True,
+        extra_data=None,
     ):
         key = (str(meta["cameraId"]), int(tid))
         try:
@@ -400,6 +421,7 @@ class FaceRecognitionService(AIServiceBase):
                 meta, parent, full_jpeg, tid, timestamp, secondary_conf,
                 save_unmatched=save_unmatched,
                 persist=persist,
+                extra_data=extra_data,
             )
             # If the tracker has already been cleared by exited_zone while
             # we were matching, don't resurrect the entry.
@@ -423,7 +445,8 @@ class FaceRecognitionService(AIServiceBase):
         print(f"entered_zone id={id}")
         asyncio.create_task(
             self._run_match(meta, parent, full_jpeg, id, timestamp,
-                            secondary_conf, save_unmatched=True)
+                            secondary_conf, save_unmatched=True,
+                            extra_data=extra_data)
         )
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
@@ -444,7 +467,8 @@ class FaceRecognitionService(AIServiceBase):
         asyncio.create_task(
             self._run_match(meta, parent, full_jpeg, id, timestamp,
                             secondary_conf, save_unmatched=False,
-                            persist=not already_resolved)
+                            persist=not already_resolved,
+                            extra_data=extra_data)
         )
 
     def dwell_alert(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):

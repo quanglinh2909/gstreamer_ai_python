@@ -92,11 +92,22 @@ class ProcessAiService:
         Id chưa từng xuất hiện trong một khung có ảnh thì không có gì để lùi về
         — giữ hộp hiện tại, thà lệch còn hơn mất hẳn sự kiện. Hiếm, vì cứ ≤400ms
         là có một khung kèm ảnh.
+
+        VẬT KHÔNG ĐƯỢC TRACK cũng phải lùi theo. Cách "bám theo xe" track chiếc
+        xe nhưng CẮT ẢNH cái biển, mà biển không có tracker id nên không có gì
+        trong bảng để tra — bỏ qua là ảnh biển lưu ra bị xén mất một hai ký tự
+        đầu đúng bằng quãng xe đi. Biển gắn trên xe thì đi cùng xe, nên dịch nó
+        theo đúng ĐỘ DỊCH của hộp xe chứa nó.
         """
         if not stale_boxes:
             return meta
+
+        dets = meta.get("detections", [])
+        # Độ dịch (dx, dy) của từng vật được track, kèm hộp HIỆN TẠI của nó để
+        # còn biết vật không-track nào nằm trong ai.
+        shifts = []
         patched = []
-        for det in meta.get("detections", []):
+        for det in dets:
             tid = det.get("tracker_id")
             box = stale_boxes.get(int(tid)) if tid is not None else None
             if box is None:
@@ -104,10 +115,46 @@ class ProcessAiService:
                 continue
             shifted = dict(det)
             shifted["x1"], shifted["y1"], shifted["x2"], shifted["y2"] = box
+            shifts.append((det, box[0] - det["x1"], box[1] - det["y1"]))
             patched.append(shifted)
+
+        if shifts:
+            for index, det in enumerate(dets):
+                if det.get("tracker_id") is not None:
+                    continue
+                owner = ProcessAiService._containing_shift(det, shifts)
+                if owner is None:
+                    continue
+                dx, dy = owner
+                moved = dict(det)
+                moved["x1"] = det["x1"] + dx
+                moved["y1"] = det["y1"] + dy
+                moved["x2"] = det["x2"] + dx
+                moved["y2"] = det["y2"] + dy
+                patched[index] = moved
+
         aligned = dict(meta)
         aligned["detections"] = patched
         return aligned
+
+    @staticmethod
+    def _containing_shift(det, shifts):
+        """(dx, dy) của vật được track ÔM lấy `det` khít nhất, hoặc None.
+
+        Khít nhất = hộp nhỏ nhất mà vẫn chứa nó, giống luật sở hữu bên
+        AIServiceBase._attach_owner: biển nằm trong cả hộp xe máy lẫn hộp xe
+        tải chồng lên thì nó thuộc về cái ôm sát hơn."""
+        cx = (det["x1"] + det["x2"]) / 2.0
+        cy = (det["y1"] + det["y2"]) / 2.0
+        best, best_area = None, None
+        for owner, dx, dy in shifts:
+            if not (owner["x1"] <= cx <= owner["x2"]
+                    and owner["y1"] <= cy <= owner["y2"]):
+                continue
+            area = (owner["x2"] - owner["x1"]) * (owner["y2"] - owner["y1"])
+            if best_area is None or area < best_area:
+                best, best_area = (dx, dy), area
+        return best
 
     def invalidate(self, camera_id: str, job_id: Optional[str] = None) -> None:
         """Drop the cached per-(camera, job) state so the next inbound
@@ -432,7 +479,15 @@ class ProcessAiService:
                 exit_grace = ProcessAiHepper.lost_buffer_frames(
                     ai_config.tracker, ai_config.fps,
                 )
-                service_ai = ProcessAiHepper.get_service_ai(ai_config.type)
+                # Biến thể (cách làm) camera này đang chạy nằm trong
+                # extra_data; nó vừa chọn LỚP XỬ LÝ vừa quyết định track lớp
+                # nào, nên phải đọc ra trước khi dựng state.
+                variant_extra = (
+                    ai_config.extra_data if ai_config.extra_data is not None else {}
+                )
+                service_ai = ProcessAiHepper.get_service_ai(
+                    ai_config.type, variant_extra,
+                )
                 self.process_ai.setdefault(camera_id, {})[job_id] = {
                     "tracker": tracker,
                     "polygons": polygons,
@@ -447,9 +502,13 @@ class ProcessAiService:
                     "service_ai": service_ai,
                     # Classes this service wants tracked (None = all). Only
                     # gates the tracker input; meta still carries every class.
-                    "track_class_ids": ProcessAiHepper.get_track_class_ids(service_ai),
+                    "track_class_ids": ProcessAiHepper.get_track_class_ids(
+                        service_ai, variant_extra,
+                    ),
                     # Cosmetic per-class name/color for the debug overlay only.
-                    "class_meta": ProcessAiHepper.get_class_meta(service_ai),
+                    "class_meta": ProcessAiHepper.get_class_meta(
+                        service_ai, variant_extra,
+                    ),
                     "secondary_conf": ai_config.secondary_conf,
                     "primary_conf": ai_config.primary_conf,
                     "ai_type": ai_config.type,
@@ -458,7 +517,17 @@ class ProcessAiService:
                     "save_detections": bool(getattr(ai_config, "save_detections", False)),
                     # Free-form per-config JSON forwarded to the service hooks.
                     # Falls back to {} for rows saved before the column existed.
-                    "extra_data": ai_config.extra_data if ai_config.extra_data is not None else {},
+                    #
+                    # `save_events` là CỘT chứ không phải khoá trong JSON, nhưng
+                    # trộn vào đây để đi cùng một đường với mọi cài đặt khác của
+                    # cặp (camera, loại AI): hook nào cũng đã nhận extra_data
+                    # sẵn, nên không phải nối thêm một tham số xuyên bốn service.
+                    # Trộn vào BẢN SAO — dict gốc của ORM không được đụng tới,
+                    # không thì lần lưu sau ghi ngược khoá này vào JSON của DB.
+                    "extra_data": {
+                        **(ai_config.extra_data if ai_config.extra_data is not None else {}),
+                        "save_events": bool(getattr(ai_config, "save_events", True)),
+                    },
                 }
             else:
                 state = self.process_ai[camera_id][job_id]

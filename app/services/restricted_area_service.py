@@ -15,7 +15,7 @@ from app.dto.restricted_area_dto import RestrictedAreaDTO
 from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.models.restricted_areas import RestrictedArea
 from app.repositories.restricted_area_repository import RestrictedAreaRepository
-from app.services.ai_job_service import AIJobSpec, ai_job_service
+from app.services.ai_job_service import AIJobSpec, AIStage, AIVariant, ai_job_service
 from app.services.ai_service_base import AIServiceBase
 from app.ws.restricted_area_event_ws import restricted_area_event_broadcaster
 
@@ -25,35 +25,25 @@ from app.ws.restricted_area_event_ws import restricted_area_event_broadcaster
 # events entirely, no Python-side filter needed.
 RESTRICTED_AREA_SPEC = AIJobSpec(
     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
-    transform_data=None,
     name="restricted area",
-    model_file_1="yolov8.rknn",
-    model_file_2=None,
-    model_type_1="yolov8_detect",
-    model_type_2=None,
-    class_filter="0",
+    stages=(
+        AIStage(model_file="yolov8.rknn", model_type="yolov8_detect",
+                class_filter="0"),
+    ),
 )
 
 # RESTRICTED_AREA_SPEC = AIJobSpec(
 #     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
-#     transform_data=None,
 #     name="restricted area",
-#     model_file_1="yolov8-mask-s.rknn",
-#     model_file_2=None,
-#     model_type_1="yolov8_detect",
-#     model_type_2=None,
-#     class_filter="0,3,5"
+#     stages=(AIStage(model_file="yolov8-mask-s.rknn",
+#                     model_type="yolov8_detect", class_filter="0,3,5"),),
 # )
 
 # RESTRICTED_AREA_SPEC = AIJobSpec(
 #     config_type=TypeConfigAiEnum.RESTRICTED_AREA.value,
-#     transform_data=None,
 #     name="restricted area",
-#     model_file_1="rf_detr_m.rknn",
-#     model_file_2=None,
-#     model_type_1="rf_detect",
-#     model_type_2=None,
-#     class_filter="1",
+#     stages=(AIStage(model_file="rf_detr_m.rknn",
+#                     model_type="rf_detect", class_filter="1"),),
 # )
 
 # ─── Gọi điện thoại báo động (voip24h) ───────────────────────────────
@@ -80,16 +70,24 @@ VOICE_ALERT_COOKIE = os.getenv("VOICE_ALERT_COOKIE", "PHPSESSID=66m5fvbq269hossu
 VOICE_ALERT_TIMEOUT_S = float(os.getenv("VOICE_ALERT_TIMEOUT_S", "10"))
 
 
+# Một cách làm; model cụ thể thì chọn được riêng trên giao diện (build_spec),
+# nhưng cách LÀM thì chỉ có một: mọi hộp giữ lại đều được track, không có lớp
+# phụ nào gắn vào. Nên giao diện không hiện ô chọn loại.
+RESTRICTED_AREA_VARIANT = AIVariant(
+    id="detect_track_all",
+    label="Phát hiện + bám mọi lớp giữ lại",
+    spec=RESTRICTED_AREA_SPEC,
+)
+
+
 class RestrictedAreaService(AIServiceBase):
-    # YOLO class ids to run tracking / zone logic on. Read by
-    # process_ai_service via ProcessAiHepper.get_track_class_ids.
-    #
-    # Only class 0 (person) produces restricted-area events, but unlike
-    # AIJobSpec.class_filter (which drops classes in the C++ engine, before
-    # the message is built) this filters Python-side at the tracker input —
-    # so meta["detections"] still lists every class the model saw and the
-    # debug MJPEG overlay keeps showing them. Set to None to track all.
-    # TRACK_CLASS_IDS = frozenset({0})
+    VARIANTS = (RESTRICTED_AREA_VARIANT,)
+
+    # Lọc lớp cho tracker (track_classes của biến thể) khác với
+    # AIStage.class_filter: class_filter cắt ngay trong engine C++ nên lớp bị
+    # bỏ không có mặt trong meta luôn, còn track_classes chỉ chặn ở ĐẦU VÀO
+    # tracker — meta vẫn liệt kê đủ mọi lớp model thấy và overlay gỡ lỗi vẫn
+    # vẽ chúng. Vùng cấm dùng class_filter (lọc từ engine) nên track hết.
 
     # (camera_id, tracker_id) -> timestamp of the last event written for that
     # tracker. A tracker that exits and re-enters within this window (brief
@@ -118,37 +116,44 @@ class RestrictedAreaService(AIServiceBase):
             return "rf_detect"
         return "yolov8_detect"
 
+    # Vùng cấm chỉ có MỘT tầng, nên "tầng gốc" ở đây luôn là stages[0].
+    @staticmethod
+    def _root() -> AIStage:
+        return RESTRICTED_AREA_SPEC.stages[0]
+
     @classmethod
     def build_spec(cls, req: RestrictedAreaDTO) -> AIJobSpec:
         """Spec ĐỘNG theo lựa chọn trên giao diện; trường nào bỏ trống thì lấy
         mặc định của RESTRICTED_AREA_SPEC (AIJobSpec là frozen dataclass)."""
-        model_file = (req.modelFile or "").strip() or RESTRICTED_AREA_SPEC.model_file_1
+        root = cls._root()
+        model_file = (req.modelFile or "").strip() or root.model_file
         model_type = (req.modelType or "").strip() or (
-            RESTRICTED_AREA_SPEC.model_type_1
-            if model_file == RESTRICTED_AREA_SPEC.model_file_1
+            root.model_type
+            if model_file == root.model_file
             else cls._infer_model_type(model_file)
         )
         # classFilter: None = không gửi -> giữ mặc định; "" = giữ TẤT CẢ lớp.
         class_filter = (
-            RESTRICTED_AREA_SPEC.class_filter
+            root.class_filter
             if req.classFilter is None
             else req.classFilter.strip()
         )
         return dc_replace(
             RESTRICTED_AREA_SPEC,
-            model_file_1=model_file,
-            model_type_1=model_type,
-            class_filter=class_filter,
+            stages=(dc_replace(root, model_file=model_file,
+                               model_type=model_type,
+                               class_filter=class_filter),),
         )
 
     async def restricted_area(self, db: AsyncSession, req: RestrictedAreaDTO):
         spec = self.build_spec(req)
+        root = spec.stages[0]
         # Lưu lựa chọn vào ai_configs.extra_data để giao diện nạp lại đúng
         # model/lớp đang chạy (engine chỉ giữ path, không giữ tên file).
         extra = {
-            "modelFile": spec.model_file_1,
-            "modelType": spec.model_type_1,
-            "classFilter": spec.class_filter or "",
+            "modelFile": root.model_file,
+            "modelType": root.model_type,
+            "classFilter": root.class_filter or "",
         }
         return await ai_job_service.upsert(db, req, spec, extra_data=extra)
 
@@ -161,16 +166,17 @@ class RestrictedAreaService(AIServiceBase):
             )
         )).scalars().first()
         extra = (row.extra_data if row and isinstance(row.extra_data, dict) else {}) or {}
+        root = self._root()
         return {
-            "modelFile": extra.get("modelFile") or RESTRICTED_AREA_SPEC.model_file_1,
-            "modelType": extra.get("modelType") or RESTRICTED_AREA_SPEC.model_type_1,
+            "modelFile": extra.get("modelFile") or root.model_file,
+            "modelType": extra.get("modelType") or root.model_type,
             "classFilter": extra.get("classFilter")
             if extra.get("classFilter") is not None
-            else (RESTRICTED_AREA_SPEC.class_filter or ""),
+            else (root.class_filter or ""),
             "defaults": {
-                "modelFile": RESTRICTED_AREA_SPEC.model_file_1,
-                "modelType": RESTRICTED_AREA_SPEC.model_type_1,
-                "classFilter": RESTRICTED_AREA_SPEC.class_filter or "",
+                "modelFile": root.model_file,
+                "modelType": root.model_type,
+                "classFilter": root.class_filter or "",
             },
         }
 
@@ -224,10 +230,12 @@ class RestrictedAreaService(AIServiceBase):
     EVENT_BROADCASTER = restricted_area_event_broadcaster
     EVENT_SOURCE = "restricted_area"
 
-    async def _persist_event(self, meta, parent, full_jpeg, tid, timestamp):
+    async def _persist_event(self, meta, parent, full_jpeg, tid, timestamp,
+                             extra_data=None):
         await self.save_event(
             meta, parent, full_jpeg, tid, timestamp,
             payload={"class_id": parent.get("classId")},
+            extra_data=extra_data,
         )
 
     @staticmethod
@@ -282,7 +290,7 @@ class RestrictedAreaService(AIServiceBase):
         self._last_saved[key] = timestamp
         print(f"restricted_area entered_zone id={id} class={parent.get('classId')}")
         asyncio.create_task(
-            self._persist_event(meta, parent, full_jpeg, id, timestamp)
+            self._persist_event(meta, parent, full_jpeg, id, timestamp, extra_data)
         )
         # self._fire_voice_call(str(meta["cameraId"]), timestamp)
 

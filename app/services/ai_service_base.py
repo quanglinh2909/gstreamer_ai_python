@@ -19,6 +19,7 @@ cột riêng của mình.
 """
 
 import asyncio
+import base64
 import datetime
 import os
 import sys
@@ -26,6 +27,7 @@ import sys
 import cv2
 import numpy as np
 
+from app.services.ai_job_service import AIJobService
 from app.utils.image_crop import fixed_size_crop
 
 # <repo>/uploads — services import this from here so every one of them
@@ -54,6 +56,152 @@ class AIServiceBase:
     EVENT_BROADCASTER = None
     #: Nhãn ngắn cho log lỗi và cho `source` gửi sang engine lúc đánh thức ghi.
     EVENT_SOURCE = "ai"
+
+    # ─── Biến thể (cách làm) của loại AI này ──────────────────────────
+    #
+    # Tuple các AIVariant, biến thể ĐẦU TIÊN là mặc định. Loại AI nào cũng
+    # phải khai ít nhất một biến thể — kể cả khi chỉ có đúng một cách làm —
+    # để mọi thứ phía sau (tracking, gắn lớp phụ, overlay) đọc từ CÙNG một
+    # chỗ thay vì rải rác thành thuộc tính lớp.
+    VARIANTS: tuple = ()
+
+    @classmethod
+    def variant(cls, extra_data=None):
+        """Biến thể đang áp cho một camera, theo extra_data["variant"].
+
+        Không khai / khai id lạ (biến thể bị xoá khỏi code sau khi camera đã
+        lưu) đều rơi về biến thể đầu tiên: thà chạy cách mặc định còn hơn tắt
+        AI của camera đó."""
+        if not cls.VARIANTS:
+            return None
+        wanted = (extra_data or {}).get("variant")
+        for v in cls.VARIANTS:
+            if v.id == wanted:
+                return v
+        return cls.VARIANTS[0]
+
+    @classmethod
+    def resolve_variant(cls, req):
+        """Biến thể theo lựa chọn gửi lên từ giao diện (`req.variant`).
+
+        Không gửi = dùng mặc định, nên client cũ và loại AI chỉ có một cách làm
+        đều chạy y như trước mà không phải sửa gì."""
+        return cls.variant({"variant": getattr(req, "variant", None)})
+
+    @classmethod
+    def variant_options(cls):
+        """Danh sách biến thể cho giao diện. Một phần tử thì giao diện không
+        hiện ô chọn — không có gì để chọn.
+
+        Kèm luôn CÂY MODEL của từng biến thể: trang thử model nạp thẳng cây này
+        vào form để chạy đúng thứ camera đang chạy, thay vì bắt người dùng gõ
+        lại tay rồi tự hỏi vì sao kết quả khác. Ô chọn cách xử lý chỉ đọc
+        id/label nên thêm khoá này không ảnh hưởng gì tới nó."""
+        return [
+            {
+                "id": v.id,
+                "label": v.label,
+                "stages": [
+                    AIJobService.stage_preview(s, i)
+                    for i, s in enumerate(v.spec.stages)
+                ],
+            }
+            for v in cls.VARIANTS
+        ]
+
+    @staticmethod
+    def containment(outer, inner):
+        """Phần diện tích của `inner` nằm trong `outer` (0..1).
+
+        KHÔNG phải IoU: box phụ (khẩu trang, biển số) luôn nhỏ hơn hẳn box
+        chính (người, xe) nên IoU luôn bé và không phân biệt được gì. Cái cần
+        biết là "cái nhỏ có nằm gọn trong cái lớn không"."""
+        ix1 = max(outer.get("x1", 0), inner.get("x1", 0))
+        iy1 = max(outer.get("y1", 0), inner.get("y1", 0))
+        ix2 = min(outer.get("x2", 0), inner.get("x2", 0))
+        iy2 = min(outer.get("y2", 0), inner.get("y2", 0))
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inner_area = ((inner.get("x2", 0) - inner.get("x1", 0)) *
+                      (inner.get("y2", 0) - inner.get("y1", 0)))
+        if inner_area <= 0:
+            return 0.0
+        return ((ix2 - ix1) * (iy2 - iy1)) / inner_area
+
+    @classmethod
+    def find_attached(cls, meta, parent, extra_data=None):
+        """Box phụ thuộc về box được track này, hoặc None.
+
+        Chấm điểm bằng độ tin cậy × tỉ lệ nằm trong, nên giữa hai biển số
+        cùng lọt vào khung một chiếc xe thì cái nằm gọn hơn và chắc hơn thắng.
+
+        MỘT VẬT PHỤ CHỈ THUỘC VỀ MỘT VẬT CHÍNH. Đây không phải chuyện sạch sẽ
+        lý thuyết: model xe hay vẽ hai hộp chồng nhau lên cùng một chiếc xe
+        (đo trên 22 biển thật thì 14% nằm gọn trong HAI hộp xe, lớp [1,4],
+        [2,2], [3,1]). Không có luật sở hữu thì cả hai xe đều nhận cùng một
+        biển, mỗi xe là một track, và một lượt xe vào đẻ ra hai sự kiện chữ
+        giống hệt nhau. Nên sau khi chọn được box phụ hợp nhất, còn phải kiểm
+        lại chính mình có phải chủ của nó không; không phải thì thử box phụ
+        kế tiếp, hết thì thôi.
+
+        Biến thể không khai attach_classes trả về None — lúc đó chính box được
+        track đã là vật cần xử lý rồi (biển số tự nó là một track)."""
+        variant = cls.variant(extra_data)
+        if not variant or not variant.attach_classes or parent is None:
+            return None
+
+        candidates = []
+        for det in meta.get("detections", []):
+            if det.get("classId") not in variant.attach_classes:
+                continue
+            ratio = cls.containment(parent, det)
+            if ratio < variant.attach_containment:
+                continue
+            candidates.append((float(det.get("score", 0.0)) * ratio, det))
+
+        candidates.sort(key=lambda item: -item[0])
+        for _, det in candidates:
+            if cls._attach_owner(meta, det, variant) is parent:
+                return det
+        return None
+
+    @classmethod
+    def _attach_owner(cls, meta, attached, variant):
+        """Vật chính SỞ HỮU một vật phụ: hộp chứa nó nhiều nhất.
+
+        Hoà nhau (biển nằm gọn trong cả hộp xe máy lẫn hộp xe tải chồng lên
+        nó) thì hộp NHỎ HƠN thắng — biển gắn trên cái xe ôm sát nó, không phải
+        cái hộp to bao ngoài."""
+        best, best_key = None, None
+        for det in meta.get("detections", []):
+            class_id = det.get("classId")
+            if class_id in variant.attach_classes:
+                continue
+            if (variant.track_classes is not None
+                    and class_id not in variant.track_classes):
+                continue
+            ratio = cls.containment(det, attached)
+            if ratio < variant.attach_containment:
+                continue
+            area = ((det.get("x2", 0) - det.get("x1", 0)) *
+                    (det.get("y2", 0) - det.get("y1", 0)))
+            key = (ratio, -area)
+            if best_key is None or key > best_key:
+                best, best_key = det, key
+        return best
+
+    @classmethod
+    def subject(cls, meta, parent, extra_data=None):
+        """Vật thật sự cần xử lý cho một tracker id, hoặc None.
+
+        Biến thể có gắn lớp phụ (track xe, biển gắn vào xe) thì đó là box phụ,
+        và KHÔNG rơi về box được track: một chiếc xe không mang biển nào thì
+        chẳng có gì để đọc, trả về xe chỉ khiến chỗ gọi đi đọc nhầm. Biến thể
+        không gắn gì thì chính box được track là vật cần xử lý."""
+        variant = cls.variant(extra_data)
+        if variant and variant.attach_classes:
+            return cls.find_attached(meta, parent, extra_data)
+        return parent
 
     # Crop geometry. `CROP_PAD_*` is outward padding as a ratio of the
     # bbox width/height; `CROP_OUTPUT_*` is the fixed output size (aspect
@@ -173,6 +321,44 @@ class AIServiceBase:
     # vài cột riêng. Gộp về đây để thêm một loại sự kiện không còn phải chép
     # lại cả khối try/except + to_thread + broadcast.
 
+    @staticmethod
+    def should_save_events(extra_data) -> bool:
+        """Cấu hình (camera, loại AI) này có GHI sự kiện xuống DB/đĩa không.
+
+        Thiếu khoá = BẬT. Cấu hình lưu trước khi có cột, và mọi đường gọi chưa
+        kịp truyền extra_data xuống, đều phải giữ nguyên hành vi cũ — mất sự
+        kiện âm thầm tệ hơn nhiều so với ghi thừa."""
+        return bool((extra_data or {}).get("save_events", True))
+
+    @classmethod
+    def _render_crop_blocking(cls, full_jpeg, parent):
+        """Ảnh crop dạng data-URL + box, KHÔNG chạm đĩa.
+
+        Dùng khi camera tắt ghi sự kiện: thẻ trên bảng sự kiện trực tiếp vẫn
+        cần một tấm ảnh để nhìn, mà cả điểm của việc tắt là không để lại gì.
+        Chỉ gửi CROP (vài KB) chứ không gửi khung hình đầy đủ — sự kiện đã khử
+        trùng theo track nên thưa, nhưng nhét vài trăm KB base64 vào mỗi gói
+        WebSocket thì vẫn là phí vô ích, và modal xem chi tiết vốn đã rơi về
+        ảnh crop khi không có ảnh toàn cảnh."""
+        if not full_jpeg:
+            return None
+        img = cv2.imdecode(np.frombuffer(full_jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        crop = cls._make_crop(
+            img,
+            float(parent.get("x1", 0.0)), float(parent.get("y1", 0.0)),
+            float(parent.get("x2", 0.0)), float(parent.get("y2", 0.0)),
+        )
+        if crop is None:
+            return None
+        ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return None
+        h, w = img.shape[:2]
+        data_url = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
+        return data_url, cls._normalized_box(parent, w, h)
+
     async def save_event(
         self,
         meta,
@@ -183,6 +369,7 @@ class AIServiceBase:
         columns=None,
         payload=None,
         confidence=None,
+        extra_data=None,
     ):
         """Ghi một sự kiện của loại này và trả về hàng đã lưu (hoặc None).
 
@@ -190,6 +377,12 @@ class AIServiceBase:
         `payload` là các trường riêng thêm vào gói WebSocket. `confidence` để
         ghi đè điểm tin cậy: khuôn mặt lưu ĐỘ GIỐNG với người đã đăng ký, không
         phải điểm phát hiện của box.
+
+        `extra_data` mang cấu hình của cặp (camera, loại AI). Khi nó TẮT việc
+        ghi sự kiện thì hàm này không đụng vào DB lẫn đĩa nhưng VẪN bắn gói
+        realtime (kèm ảnh crop dạng data-URL) — camera đó vẫn xem được sự kiện
+        đang xảy ra, chỉ là không tra cứu lại được về sau. Lúc đó trả về None
+        vì thật sự không có hàng nào.
 
         Trả None khi không có gì để lưu (thiếu ảnh, crop suy biến, chưa có
         session factory) — chỗ gọi không cần phân biệt vì sự kiện thiếu ảnh
@@ -200,6 +393,11 @@ class AIServiceBase:
         if session_factory is None:
             return None
         try:
+            if not self.should_save_events(extra_data):
+                return await self._broadcast_transient(
+                    meta, parent, full_jpeg, timestamp, columns, payload, confidence,
+                )
+
             paths = await asyncio.to_thread(
                 self._save_images_blocking, full_jpeg, meta, parent, stem_value,
             )
@@ -244,6 +442,41 @@ class AIServiceBase:
         except Exception as exc:
             print(f"{self.EVENT_SOURCE} persist error: {exc}", file=sys.stderr)
             return None
+
+    async def _broadcast_transient(self, meta, parent, full_jpeg, timestamp,
+                                   columns, payload, confidence):
+        """Sự kiện CHỈ realtime: bắn đi rồi thôi, không DB không đĩa.
+
+        Gói giữ nguyên hình dạng của sự kiện đã lưu để bảng sự kiện không phải
+        biết hai loại, chỉ khác `id = None` (chưa từng có hàng nào) và
+        `transient = True` cho phía giao diện muốn đánh dấu "không lưu lại".
+        Các cột riêng của loại (plate_number, mask_status…) vẫn đi kèm, vì đó
+        chính là nội dung người dùng cần đọc trên thẻ.
+        """
+        if self.EVENT_BROADCASTER is None:
+            return None
+        rendered = await asyncio.to_thread(
+            self._render_crop_blocking, full_jpeg, parent,
+        )
+        crop_url, box = rendered if rendered else ("", None)
+        self.EVENT_BROADCASTER.publish({
+            "id": None,
+            "camera_id": str(meta["cameraId"]),
+            "confidence": float(
+                parent.get("score", 0.0) if confidence is None else confidence
+            ),
+            "timestamp": int(timestamp),
+            "image_full": "",
+            "image_crop": crop_url,
+            "box": box,
+            "transient": True,
+            **(columns or {}),
+            **(payload or {}),
+        })
+        # KHÔNG gọi arm_recording: giữ đoạn video là chuyện của chế độ ghi bên
+        # camera, mà người dùng vừa nói rõ camera này không cần lưu lại gì của
+        # AI. Giữ lại đoạn ghi vì một sự kiện cố tình không lưu là làm ngược ý.
+        return None
 
     # ─── Ghi hình theo sự kiện AI ───────────────────────────────────────
 

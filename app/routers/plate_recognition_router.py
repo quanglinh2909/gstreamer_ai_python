@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.dto.event_dto import EventPlateResponse
 from app.dto.pagination_dto import PageResponse
 from app.dto.plate_recognition_dto import PlateRecognitionDTO
-from app.services.plate_recognition_service import plate_recognition_service
+from app.services.plate_recognition import plate_recognition_service
 
 router = APIRouter()
 prefix = "/plate-recognition"
@@ -25,11 +25,15 @@ async def plate_recognition_test(
     image: UploadFile = File(...),
     primary_conf: float = Form(0.3),
     secondary_conf: float = Form(0.3),
+    variant: str = Form(None),
 ):
+    """Thử trên ảnh bằng ĐÚNG cây model của biến thể đang chọn — để so hai
+    cách đọc biển trên cùng một tấm ảnh trước khi bật lên camera."""
     return await plate_recognition_service.test_inference(
         image=(image.filename, await image.read(), image.content_type),
         primary_conf=primary_conf,
         secondary_conf=secondary_conf,
+        variant=variant,
     )
 
 

@@ -10,7 +10,7 @@ from app.dto.face_mask_dto import FaceMaskDTO
 from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.models.event_mask import EventMask
 from app.repositories.event_mask_repository import EventMaskRepository
-from app.services.ai_job_service import AIJobSpec, ai_job_service
+from app.services.ai_job_service import AIJobSpec, AIStage, AIVariant, ai_job_service
 from app.services.ai_service_base import AIServiceBase
 from app.utils.open_door.door_manager import door_manager
 from app.ws.mask_event_ws import mask_event_broadcaster
@@ -18,29 +18,41 @@ from app.ws.mask_event_ws import mask_event_broadcaster
 
 FACE_MASK_SPEC = AIJobSpec(
     config_type=TypeConfigAiEnum.FACE_MASK.value,
-    transform_data=None,
     name=TypeConfigAiEnum.FACE_MASK.value,
-    model_file_1="yolov8m-mask.rknn",
-    model_file_2=None,
-    model_type_1="yolov8_detect",
-    model_type_2=None,
-    class_filter="0,3,5"
+    stages=(
+        AIStage(model_file="yolov8m-mask.rknn", model_type="yolov8_detect",
+                class_filter="0,3,5"),
+    ),
 )
 
-class FaceMaskService(AIServiceBase):
-    TRACK_CLASS_IDS = frozenset({0})
-
+# Một model duy nhất tìm cả ba lớp: người (0), không khẩu trang (3), có khẩu
+# trang (5). Chỉ NGƯỜI được track — hai lớp kia là TRẠNG THÁI của người đó
+# trong khung hình này, gắn vào người bằng độ nằm-trong. Track chúng riêng thì
+# id nhảy loạn mỗi lần người quay mặt đi.
+#
+# Loại này chỉ có một cách làm nên giao diện sẽ không hiện ô chọn.
+FACE_MASK_VARIANT = AIVariant(
+    id="yolov8_mask",
+    label="YOLOv8 khẩu trang (một model)",
+    spec=FACE_MASK_SPEC,
+    track_classes=frozenset({0}),
+    attach_classes=frozenset({3, 5}),
     # Debug-overlay metadata per classId (optional, cosmetic only — read by
     # the MJPEG overlay in app/utils/ai_debug_overlay.py):
     #   "name"  – hiển thị thay cho "cls=<id>" trong nhãn box.
     #   "color" – tô màu box, ghi đè màu xanh/đỏ theo zone. Nhận tuple BGR
     #             (kiểu OpenCV) hoặc chuỗi hex "#RRGGBB"/"RRGGBB" (RGB).
     # Class nào không khai báo thì giữ nguyên hành vi cũ (cls=<id>, màu zone).
-    CLASS_META = {
+    class_meta={
         0: {"name": "Person"},
-        3: {"name": "No Mask", "color":  "#34C759"},
-        5: {"name": "Mask", "color":"#FF3B30"},
-    }
+        3: {"name": "No Mask", "color": "#34C759"},
+        5: {"name": "Mask", "color": "#FF3B30"},
+    },
+)
+
+
+class FaceMaskService(AIServiceBase):
+    VARIANTS = (FACE_MASK_VARIANT,)
 
     def __init__(self):
         self._hunmain: dict = {}
@@ -90,57 +102,22 @@ class FaceMaskService(AIServiceBase):
     ):
         return await EventMaskRepository.list_paginated(db, page, size, camera_id)
 
-    def calculate_containment(self, person_box, face_box):
-        """Tính tỷ lệ face nằm trong person (0-1)"""
-        px1, py1, px2, py2 = person_box
-        fx1, fy1, fx2, fy2 = face_box
+    def _get_best_match_class_id(self, meta, parent, extra_data=None):
+        """Lớp trạng thái (3 = không khẩu trang / 5 = có) của người đang xét.
 
-        # Tính diện tích giao nhau
-        inter_x1 = max(px1, fx1)
-        inter_y1 = max(py1, fy1)
-        inter_x2 = min(px2, fx2)
-        inter_y2 = min(py2, fy2)
+        Việc tìm box phụ nằm trong box được track là chuyện CHUNG của mọi loại
+        AI (biển số gắn vào xe cũng y hệt) nên nằm ở AIServiceBase.find_attached
+        và lấy danh sách lớp từ biến thể; ở đây chỉ còn dịch ra classId."""
+        attached = self.find_attached(meta, parent, extra_data)
+        return attached.get("classId") if attached else "UNKNOWN"
 
-        if inter_x2 < inter_x1 or inter_y2 < inter_y1:
-            return 0.0
-
-        inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
-        face_area = (fx2 - fx1) * (fy2 - fy1)
-
-        # Tỷ lệ face nằm trong person
-        return inter_area / face_area if face_area > 0 else 0.0
-
-    def _get_best_match_class_id(self, meta, parent):
-        detections = meta.get("detections", [])
-        x1 = parent.get("x1")
-        y1 = parent.get("y1")
-        x2 = parent.get("x2")
-        y2 = parent.get("y2")
-        
-        person_box = (x1, y1, x2, y2)
-        best_score = -1
-        best_match_class_id = "UNKNOWN"
-        for detection in detections:
-            classId = detection.get("classId")
-            confidence = detection.get("score", 0)
-            if classId != 3 and classId != 5:  # Chỉ quan tâm đến face (classId 3) và mask (classId 5)
-                continue
-            face_box = (detection.get("x1"), detection.get("y1"), detection.get("x2"), detection.get("y2"))
-            containment_ratio = self.calculate_containment(person_box, face_box)
-            score = confidence * containment_ratio
-            if containment_ratio >= 0.5 and score > best_score:
-                best_score = score
-                best_match_class_id = classId
-        return best_match_class_id
-
-    
     def entered_zone(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
         parent = self._find_parent(meta, id)
         if parent is None:
             return
         key = (str(meta["cameraId"]), int(id), int(zone_idx))
 
-        best_match_class_id = self._get_best_match_class_id(meta, parent)
+        best_match_class_id = self._get_best_match_class_id(meta, parent, extra_data)
         if best_match_class_id == 5:
             play_sound.q_play_sound.put({"link": "access/mask.mp3", "time": timestamp})
         else:
@@ -174,7 +151,7 @@ class FaceMaskService(AIServiceBase):
     # identically.
     def _fire_alert(self, id, class_id, meta, full_jpeg, parent, timestamp,
                     is_save=True, alert_sound=True, barrier_duration=0.5,
-                    confidence=0.0):
+                    confidence=0.0, extra_data=None):
         x1, y1 = parent.get("x1"), parent.get("y1")
         x2, y2 = parent.get("x2"), parent.get("y2")
 
@@ -216,6 +193,7 @@ class FaceMaskService(AIServiceBase):
                 "track_id": int(id),
             },
             confidence=float(confidence or 0.0),
+            extra_data=extra_data,
         ))
 
     def in_the_area(self, id, meta, full_jpeg, timestamp, secondary_conf, extra_data=None, zone_idx=0):
@@ -239,7 +217,7 @@ class FaceMaskService(AIServiceBase):
         # tín hiệu, coi như cổng hỏng — rơi về mặc định an toàn hơn.
         barrier_duration = float(extra.get("barrier_duration") or 0.5)
 
-        best_match_class_id = self._get_best_match_class_id(meta, parent)
+        best_match_class_id = self._get_best_match_class_id(meta, parent, extra_data)
 
         if best_match_class_id == "UNKNOWN":
             return
@@ -270,7 +248,8 @@ class FaceMaskService(AIServiceBase):
                                  parent, timestamp, is_save=True,
                                  alert_sound=alert_sound,
                                  barrier_duration=barrier_duration,
-                                 confidence=secondary_conf)
+                                 confidence=secondary_conf,
+                                 extra_data=extra_data)
         elif re_alert_seconds > 0:
             # Already confirmed and still standing there — re-alert on interval.
             last_alert_ts = hunmain_entry.get("last_alert_ts", timestamp)
@@ -280,7 +259,8 @@ class FaceMaskService(AIServiceBase):
                                  parent, timestamp, is_save=False,
                                  alert_sound=alert_sound,
                                  barrier_duration=barrier_duration,
-                                 confidence=secondary_conf)
+                                 confidence=secondary_conf,
+                                 extra_data=extra_data)
         
         
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import math
+import re
 
 from itertools import combinations
 
@@ -411,9 +412,106 @@ def detect_plate_from_secondary(det, min_secondary_conf):
     return _detect_plate_from_center_list(center_list, image_shape)
 
 
+def flatten_char_boxes(detection, limit=32):
+    """Mọi ô KÝ TỰ nằm dưới một detection, sâu mấy tầng cũng lấy được.
+
+    Hai cách đọc biển cho ra hai hình dạng cây khác nhau:
+      * OCR một tầng   — con của biển đã LÀ từng ký tự.
+      * PP-OCR hai tầng — con là DÒNG chữ, ký tự nằm ở cháu.
+    Chỗ gọi không nên phải biết mình đang chạy cách nào, nên gom về một danh
+    sách phẳng ở đây.
+
+    TOẠ ĐỘ giữ nguyên khi mọi ký tự CÙNG một không gian (con trực tiếp của
+    biển đã nắn phẳng) — đó là dạng mà thuật toán ghép biển bên dưới vốn được
+    chỉnh cho, đừng đụng vào. Chỉ khi ký tự nằm rải ở nhiều DÒNG khác nhau mới
+    phải quy về khung gốc (fx1..fy2 engine gắn cho mọi tầng con): x1..y2 của
+    một ký tự là toạ độ trong ảnh cắt của DÒNG chứa nó, nên ký tự ở hai dòng
+    khác nhau không so sánh được với nhau."""
+    kids = (detection or {}).get("children") or []
+    if not kids:
+        return []
+
+    # Con đã là ký tự (OCR một tầng): dùng thẳng, không đổi gì.
+    if not any(kid.get("children") for kid in kids):
+        return kids[:limit]
+
+    out = []
+    for line in kids:
+        for char in line.get("children") or []:
+            box = dict(char)
+            if char.get("fx1") is not None:
+                box["x1"] = char["fx1"]
+                box["y1"] = char["fy1"]
+                box["x2"] = char["fx2"]
+                box["y2"] = char["fy2"]
+            out.append(box)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+# Biển số Việt Nam có cấu trúc CỐ ĐỊNH: hai chữ số mã tỉnh, rồi sê-ri một hoặc
+# hai ký tự (chữ, hoặc chữ + số như "B2", "K1", "X3"), rồi 4-5 chữ số.
+#   50H-380.66 -> 50 H  38066     93A-350.45 -> 93 A  35045
+#   61B2-474.59-> 61 B2 47459     47K1-937.40-> 47 K1 93740
+#
+# Nhờ vậy chặn được đúng thứ đang làm phiền: ảnh mờ hoặc biển bị cắt mất một
+# góc vẫn ra chuỗi, nhưng chuỗi đó không bao giờ có dạng này. Model OCR khi
+# gặp nhiễu hay nhả ra cùng một mẫu ('ZG1AH', 'ZG12AH', 'ZG92AH') — không mẫu
+# nào lọt qua được.
+_VN_PLATE_RE = re.compile(r"^\d{2}[A-Z]{1,2}\d?\d{4,5}$")
+
+
+def looks_like_vn_plate(text_plate: str) -> bool:
+    """Chuỗi đọc được có ĐÚNG DẠNG một biển số Việt Nam không.
+
+    Chỉ xét cấu trúc, không xét nội dung — nó bắt được ảnh mờ / biển cụt / hộp
+    bắt nhầm, chứ không bắt được lỗi đọc nhầm một chữ số thành chữ số khác.
+    Sai dạng thì coi như CHƯA đọc được và thử lại ở khung sau, chứ đừng ghi
+    một dòng rác vào lịch sử."""
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", text_plate or "").upper()
+    return bool(_VN_PLATE_RE.match(cleaned))
+
+
+def plate_text_from_detection(detection, min_secondary_conf=0.3, image_shape=None):
+    """Chuỗi biển số đọc từ cây con của MỘT detection biển.
+
+    Hai cách đọc cho ra hai dạng cây, và phải xử lý khác nhau:
+
+    * PP-OCR (con là DÒNG chữ, cháu là ký tự) — dòng đã được model đọc thành
+      chuỗi có THỨ TỰ rồi, cứ ghép các dòng từ trên xuống. TUYỆT ĐỐI đừng tách
+      ra rồi xếp lại theo toạ độ: toạ độ khung gốc của từng ký tự là kết quả
+      quy đổi qua hai lần cắt nên chỉ gần đúng, đủ để hai dòng cài răng lược
+      vào nhau. Đo trên biển thật: model đọc `59X2 | 72685` (đúng) mà xếp lại
+      theo hình học ra `5972X2685`.
+
+    * OCR một tầng (con đã LÀ từng ký tự, không có chữ sẵn) — mỗi ký tự là một
+      hộp rời rạc, phải tự tách dòng và sắp thứ tự: đó là việc của
+      detect_plate_from_children.
+    """
+    children = (detection or {}).get("children") or []
+    lines = [c for c in children if c.get("children")]
+    if not lines:
+        return detect_plate_from_children(children, min_secondary_conf, image_shape)
+
+    parts = []
+    for line in sorted(lines, key=lambda l: l.get("fy1", l.get("y1", 0))):
+        chars = sorted(line["children"], key=lambda c: c.get("fx1", c.get("x1", 0)))
+        text = "".join(
+            (c.get("text") or "")
+            for c in chars
+            if float(c.get("score", 0.0)) >= min_secondary_conf
+        )
+        if text:
+            parts.append(text)
+    # Biển hai dòng viết liền nhau bằng dấu gạch, cùng dạng mà nhánh OCR một
+    # tầng vẫn sinh ra ('53-79622') để phía sau không phải phân biệt.
+    return "-".join(parts)
+
+
 def build_secondary_boxes_from_children(children, min_secondary_conf):
     center_list = []
-    for child in (children or [])[:16]:
+    for child in (children or [])[:32]:
         score = float(child.get("score", 0.0))
         if score < min_secondary_conf:
             continue
@@ -427,7 +525,10 @@ def build_secondary_boxes_from_children(children, min_secondary_conf):
             {
                 "x_c": (x1 + x2) / 2.0,
                 "y_c": (y1 + y2) / 2.0,
-                "label": class_id_to_label(int(child.get("classId", -1))),
+                # Model mang sẵn bảng nhãn (PP-OCR rec) thì ký tự nằm ở `text`;
+                # model chỉ trả classId (ocr.rknn) thì tra bảng như cũ.
+                "label": (child.get("text") or "").strip()
+                or class_id_to_label(int(child.get("classId", -1))),
                 "conf": score,
                 "x1": x1,
                 "y1": y1,

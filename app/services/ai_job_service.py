@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -8,20 +9,106 @@ from app.models.ai_config import AIConfig
 from app.repositories.ai_config_repository import AIRepository
 
 
+def job_transform(ai_job: dict) -> Optional[str]:
+    """Transform của tầng con đầu tiên trong một job engine trả về.
+
+    Chỉ dùng để ĐOÁN loại AI của job mồ côi (không có dòng ai_configs) — cách
+    nhận diện chính là job_id. Trước đây engine trả thẳng `transformData` ở
+    mức job; giờ transform nằm trong từng tầng nên phải lần vào mảng stages."""
+    for stage in (ai_job.get("stages") or [])[1:]:
+        transform = (stage or {}).get("transform")
+        if transform:
+            return transform
+    return None
+
+
+@dataclass(frozen=True)
+class AIStage:
+    """MỘT tầng của cây model. Tầng đầu chạy trên cả khung hình; mỗi tầng sau
+    chạy trên ảnh cắt ra từ từng detection của tầng cha.
+
+    Cỡ đầu vào KHÔNG khai ở đây — engine đọc thẳng từ file .rknn."""
+
+    # Tên file trong danh sách /ai-models của engine (không phải đường dẫn):
+    # upsert tra ra path thật, vì path phụ thuộc thư mục weights của board.
+    model_file: str
+    model_type: str
+    # Chỉ số tầng cha trong danh sách. None = nối vào tầng ngay trước (chuỗi
+    # thẳng), tầng đầu tiên thì là chạy trên khung hình.
+    parent: Optional[int] = None
+    # Cách dựng ảnh đầu vào từ hộp của tầng cha ("" / None = cắt thẳng theo hộp).
+    transform: Optional[str] = None
+    # Lọc ĐẦU VÀO: chỉ nhận detection của tầng cha mang lớp này. Đây là chỗ để
+    # "model 2 chỉ lấy biển số, model 3 chỉ lấy ô tô/xe máy/xe tải".
+    input_classes: Optional[str] = None
+    # Lọc ĐẦU RA: giữ lớp nào trong kết quả của CHÍNH tầng này. CSV id lớp kiểu
+    # "0,1"; None/"" = giữ tất cả. Khớp parseClassFilter bên C++ (ai/Config.hpp).
+    class_filter: Optional[str] = None
+    # Ngưỡng điểm của tầng này. 0.2 là ngưỡng engine vẫn dùng xưa nay — lọc
+    # chặt hơn là việc của phía Python (ai_configs.primary_conf), engine để
+    # rộng để tracker còn nhìn thấy vật mờ.
+    conf: float = 0.2
+
+
 @dataclass(frozen=True)
 class AIJobSpec:
     config_type: str
-    transform_data: Optional[str]
     name: str
-    model_file_1: str
-    model_file_2: Optional[str]
-    model_type_1: str
-    model_type_2: Optional[str]
-    # Comma-separated YOLO class IDs to keep, e.g. "0,1" for person+bicycle.
-    # Empty / None / "all" means keep every class. Matches C++ parseClassFilter
-    # in src/ai/Config.hpp — the engine drops detections whose cls_id isn't in
-    # the parsed set before any tracker / stage-2 work.
-    class_filter: Optional[str] = None
+    # Theo thứ tự chạy. Một model = một phần tử; thêm tầng là thêm phần tử.
+    stages: tuple = ()
+
+    @property
+    def transform_data(self) -> Optional[str]:
+        """Transform của tầng con đầu tiên có khai.
+
+        Chỉ còn dùng để NHẬN RA job kiểu cũ (xem _find_existing) — hồi engine
+        còn cứng hai model thì transform là thứ duy nhất phân biệt được job
+        khuôn mặt với job biển số trên cùng một camera."""
+        for stage in self.stages[1:]:
+            if stage.transform:
+                return stage.transform
+        return None
+
+
+@dataclass(frozen=True)
+class AIVariant:
+    """MỘT CÁCH LÀM của một loại AI.
+
+    Cùng "nhận dạng biển số" nhưng có thể làm bằng nhiều bộ model khác nhau,
+    và mỗi bộ lại tracking theo kiểu khác nhau. Biến thể gói TRỌN một cách
+    làm: cây model + tracking theo lớp nào + lớp nào gắn vào lớp được track.
+
+    Loại AI chỉ có một biến thể thì giao diện không hiện ô chọn (không có gì
+    để chọn); từ hai trở lên mới hiện.
+
+    TRACK/ATTACH giải bài toán chung: "vật CHÍNH là thứ cần bám theo thời
+    gian, vật PHỤ chỉ là thuộc tính của nó trong khung hình này".
+      * khẩu trang — track người (0), gắn có/không khẩu trang (3, 5) vào người
+      * biển số    — track XE, gắn biển (5) vào xe; biển đi theo xe, không tự
+                     sinh ra một track riêng nhảy loạn khi xe che khuất biển
+    """
+
+    id: str
+    label: str
+    spec: AIJobSpec
+    # Lớp đưa vào tracker. None = track mọi lớp (vật chính chính là đầu ra
+    # duy nhất của model, vd biển số tự nó là một track).
+    track_classes: Optional[frozenset] = None
+    # Lớp KHÔNG track, đem gắn vào box được track chứa nó nhiều nhất.
+    attach_classes: frozenset = frozenset()
+    # Phần diện tích của box phụ phải nằm trong box chính thì mới coi là của nó.
+    attach_containment: float = 0.5
+    # Tên/màu cho lớp trên overlay gỡ lỗi (thuần trang trí).
+    class_meta: Optional[dict] = None
+
+    @property
+    def transform_data(self) -> Optional[str]:
+        """Transform của tầng thứ hai — chỉ còn dùng để nhận diện job kiểu cũ
+        (xem _find_existing) và gán nhãn loại AI cho job mồ côi."""
+        for stage in self.stages[1:]:
+            if stage.transform:
+                return stage.transform
+        return None
 
 
 class AIJobService:
@@ -54,19 +141,52 @@ class AIJobService:
         if spec.transform_data:
             return next(
                 (j for j in ai_jobs
-                 if j.get("transformData") == spec.transform_data),
+                 if job_transform(j) == spec.transform_data),
                 None,
             )
         return None
 
     @staticmethod
+    def stage_preview(stage: AIStage, index: int) -> dict:
+        """AIStage -> tầng ở dạng engine hiểu, NHƯNG giữ `modelFile` thay cho
+        `modelPath`.
+
+        Dùng cho /ai-variants: trang thử model cần thấy đúng cây model mà
+        camera đang chạy để nạp vào form, mà đường dẫn thật thì phụ thuộc thư
+        mục weights của board — nó tự tra qua /ai-models của engine. Tách ra
+        khỏi `_stage_payload` để phần suy ra `parent` chỉ viết một lần: sai lệch
+        giữa "cây trang thử vẽ" và "cây camera chạy" là loại lỗi rất khó thấy."""
+        out = {
+            "modelFile": stage.model_file,
+            "modelType": stage.model_type,
+            "conf": stage.conf,
+            # Tầng 0 luôn chạy trên khung hình; mặc định còn lại là chuỗi thẳng.
+            "parent": stage.parent if stage.parent is not None
+            else (-1 if index == 0 else index - 1),
+        }
+        if stage.transform:
+            out["transform"] = stage.transform
+        if stage.input_classes is not None:
+            out["inputClasses"] = stage.input_classes
+        if stage.class_filter is not None:
+            out["classFilter"] = stage.class_filter
+        return out
+
+    @staticmethod
+    def _stage_payload(ai_models, stage: AIStage, index: int) -> dict:
+        """AIStage -> một phần tử của mảng `stages` mà engine nhận."""
+        out = AIJobService.stage_preview(stage, index)
+        out["modelPath"] = AIJobService._get_path(ai_models, out.pop("modelFile"))
+        return out
+
+    @classmethod
+    def _stages_payload(cls, ai_models, spec: AIJobSpec) -> list:
+        return [cls._stage_payload(ai_models, s, i)
+                for i, s in enumerate(spec.stages)]
+
+    @staticmethod
     def _to_ratio(value: float) -> float:
         return value / 100.0 if value > 1 else value
-
-    # Trường chỉ dùng ở phía Python, KHÔNG gửi sang engine: engine không biết
-    # gì về chúng và cũng không cần biết. `polygons` thì quá dài, đã có bảng
-    # ai_configs giữ.
-    _PYTHON_ONLY_FIELDS = {"polygons", "saveDetections"}
 
     async def upsert(self, db: AsyncSession, req, spec: AIJobSpec, extra_data=None):
         req.primaryConf = self._to_ratio(req.primaryConf)
@@ -74,37 +194,23 @@ class AIJobService:
 
         ai_jobs = await HTTPXClient.get(f"/cameras/{req.cameraId}/ai-jobs")
         existing = self._find_existing(ai_jobs, spec)
+        ai_models = await HTTPXClient.get("/ai-models")
+
+        # Dựng THẲNG payload của engine thay vì model_dump() rồi ghi đè: DTO
+        # phía Python mang một đống trường engine không biết (polygons, tracker,
+        # dwellSeconds, min_plate_length...) và chúng nằm lại trong ai_configs.
+        # Engine chỉ cần đúng 5 trường này.
+        payload = {
+            "name": spec.name,
+            "cameraId": req.cameraId,
+            "enabled": getattr(req, "enabled", True),
+            "maxFps": getattr(req, "maxFps", 0),
+            "stages": self._stages_payload(ai_models, spec),
+        }
 
         if existing:
-            ai_models = await HTTPXClient.get("/ai-models")
-            payload = req.model_dump(exclude_none=True,
-                                     exclude=self._PYTHON_ONLY_FIELDS)
-            payload["primaryConf"] = 0.2
-            payload["secondaryConf"] = 0.2
-            payload["modelPath"] = self._get_path(ai_models, spec.model_file_1)
-            payload["modelPath2"] = self._get_path(ai_models, spec.model_file_2)
-            payload["modelType"] = spec.model_type_1
-            payload["modelType2"] = spec.model_type_2
-            payload["transformData"] = spec.transform_data
-            if spec.class_filter is not None:
-                payload["classFilter"] = spec.class_filter
             data = await HTTPXClient.put(f"/ai-jobs/{existing['id']}", json=payload)
         else:
-            ai_models = await HTTPXClient.get("/ai-models")
-            payload = req.model_dump(exclude=self._PYTHON_ONLY_FIELDS)
-            payload["modelPath"] = self._get_path(ai_models, spec.model_file_1)
-            payload["modelPath2"] = self._get_path(ai_models, spec.model_file_2)
-            payload["modelType"] = spec.model_type_1
-            payload["modelType2"] = spec.model_type_2
-            payload["transformData"] = spec.transform_data
-            payload["name"] = spec.name
-            payload["primaryConf"] = 0.2
-            payload["secondaryConf"] = 0.2
-            # Pass through to the C++ engine. Empty string means "keep all
-            # classes" (matches parseClassFilter); a CSV like "0,1" keeps
-            # only those YOLO ids — drops everything else at the engine
-            # before tracker / stage-2 work.
-            payload["classFilter"] = spec.class_filter or ""
             data = await HTTPXClient.post("/ai-jobs", json=payload)
 
         await AIRepository.create_or_update(
@@ -123,6 +229,10 @@ class AIJobService:
                 extra_data=extra_data,
                 # getattr: DTO cũ chưa khai báo trường này vẫn chạy được.
                 save_detections=bool(getattr(req, "saveDetections", False)),
+                # Mặc định BẬT, và client cũ không gửi trường này cũng phải ra
+                # BẬT — nếu không, một bản giao diện cũ lưu lại cấu hình là âm
+                # thầm tắt việc ghi sự kiện của camera đó.
+                save_events=bool(getattr(req, "saveEvents", True)),
             ),
         )
         # Force the recv loop to reload tracker/polygons/thresholds for this
@@ -133,27 +243,14 @@ class AIJobService:
         process_ai_service.invalidate(req.cameraId, data.get("id"))
         return data
 
-    async def inference_model(
-        self,
-        image: tuple,
-        model_path: str,
-        model_type: str,
-        model_path_2: str,
-        model_type_2: str,
-        transform_data: str,
-        primary_conf: float = 0.3,
-        secondary_conf: float = 0.3,
-    ):
+    async def inference_model(self, image: tuple, stages: list):
+        """Chạy một cây model trên MỘT tấm ảnh.
+
+        `stages` đúng dạng mà engine nhận (mảng dict modelPath/modelType/...),
+        nên trang thử model gửi được cây bao nhiêu tầng tuỳ ý mà không phải sửa
+        gì ở đây."""
         files = {"image": image}
-        data = {
-            "modelPath": model_path,
-            "modelType": model_type,
-            "modelPath2": model_path_2,
-            "modelType2": model_type_2,
-            "transformData": transform_data,
-            "primaryConf": str(primary_conf),
-            "secondaryConf": str(secondary_conf),
-        }
+        data = {"stages": json.dumps(stages)}
         return await HTTPXClient.post("/inference/run", data=data, files=files)
 
     async def inference_with_spec(
@@ -163,17 +260,15 @@ class AIJobService:
         primary_conf: float = 0.3,
         secondary_conf: float = 0.3,
     ):
+        """Chạy đúng cây model mà spec này sẽ chạy khi bật trên camera.
+
+        primary_conf/secondary_conf ghi đè ngưỡng của tầng 0 và các tầng sau —
+        thử ảnh thường muốn nới ngưỡng hơn lúc chạy thật."""
         ai_models = await HTTPXClient.get("/ai-models")
-        return await self.inference_model(
-            image=image,
-            model_path=self._get_path(ai_models, spec.model_file_1),
-            model_type=spec.model_type_1,
-            model_path_2=self._get_path(ai_models, spec.model_file_2),
-            model_type_2=spec.model_type_2,
-            transform_data=spec.transform_data,
-            primary_conf=primary_conf,
-            secondary_conf=secondary_conf,
-        )
+        stages = self._stages_payload(ai_models, spec)
+        for i, stage in enumerate(stages):
+            stage["conf"] = primary_conf if i == 0 else secondary_conf
+        return await self.inference_model(image=image, stages=stages)
 
 
 ai_job_service = AIJobService()

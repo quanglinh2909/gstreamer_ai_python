@@ -4,20 +4,19 @@ from app.api.httpx_client import HTTPXClient
 from app.core.database import AsyncSessionLocal
 from app.enum.config_ai_enum import TypeConfigAiEnum
 from app.repositories.ai_config_repository import AIRepository
+from app.services.ai_job_service import job_transform
 
 _TRANSFORM_TO_TYPE = {
     "align_plate": TypeConfigAiEnum.PLATE_RECOGNITION.value,
     "align_face": TypeConfigAiEnum.FACE_RECOGNITION.value,
 }
 
+# Giao diện cấu hình AI không dùng tới cây model của engine — nó chỉ cần loại
+# AI, vùng vẽ và các ngưỡng. `stages` lại dài (đường dẫn tuyệt đối của từng
+# tầng) nên cắt luôn cho gọn payload.
 _AI_JOB_FIELDS_TO_STRIP = (
     "name",
-    "modelPath",
-    "modelType",
-    "classFilter",
-    "modelPath2",
-    "modelType2",
-    "transformData",
+    "stages",
 )
 
 
@@ -45,7 +44,7 @@ class CameraService:
         # type/polygons/thresholds. job_id is the canonical link.
         job_id = ai_job.get("id")
         matched = next((c for c in configs if c.job_id == job_id), None)
-        transform = ai_job.get("transformData")
+        transform = job_transform(ai_job)
 
         if matched:
             # Authoritative source: take everything we have a column for.
@@ -61,6 +60,9 @@ class CameraService:
             # Cờ ghi khung phát hiện — engine C++ không biết trường này, chỉ
             # có ở bảng cấu hình phía Python.
             ai_job["saveDetections"] = bool(getattr(matched, "save_detections", False))
+            # Cờ ghi SỰ KIỆN (khác cờ trên: cái trên là khung phát hiện từng
+            # frame để tua lại). Mặc định True cho hàng lưu trước khi có cột.
+            ai_job["saveEvents"] = bool(getattr(matched, "save_events", True))
             ai_job["extra_data"] = matched.extra_data or {}
         else:
             # Fallback for jobs that exist in the C++ engine but never

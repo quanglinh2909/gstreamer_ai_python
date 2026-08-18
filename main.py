@@ -90,6 +90,13 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE IF EXISTS cameras "
             "ADD COLUMN IF NOT EXISTS retention_days INTEGER NOT NULL DEFAULT 0"
         )
+        # Có ghi sự kiện của AI này xuống DB/đĩa hay không, theo TỪNG CAMERA và
+        # TỪNG LOẠI AI. DEFAULT true: mọi cấu hình đã có từ trước phải giữ
+        # nguyên hành vi cũ, tắt là việc người dùng chủ động chọn.
+        await conn.exec_driver_sql(
+            "ALTER TABLE IF EXISTS ai_configs "
+            "ADD COLUMN IF NOT EXISTS save_events BOOLEAN NOT NULL DEFAULT true"
+        )
     # Prime the plate whitelist cache before the ALPR consumer thread
     # starts so the very first detection can hit the in-memory map.
     async with AsyncSessionLocal() as db:
